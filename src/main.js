@@ -22,6 +22,7 @@ const game = {
 
 function resize() {
   const cw = window.innerWidth, ch = window.innerHeight;
+  if (!cw || !ch) return; // hidden / zero-size window: keep the last good layout
   const W = 720;
   const H = Math.round(Math.min(1700, Math.max(1100, (W * ch) / cw)));
   const scale = Math.min(cw / W, ch / H);
