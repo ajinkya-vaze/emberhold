@@ -1,83 +1,64 @@
-// armor: fraction of PHYSICAL damage blocked. Magic ignores armor.
-// hit: damage dealt to the wall per strike (one strike per `hitEvery` seconds).
+// armor: fraction of arrow damage blocked.
+// hit: damage per strike against the Keep / barricades (the King takes kingHit× this).
+// coins: total coin value dropped on death.
 // tip: shown the first time a stage introduces this enemy.
 export const ENEMIES = {
-  grunt:   { name: 'Raider',        hp: 108,  speed: 52,  armor: 0,    bounty: 6,   hit: 9,  hitEvery: 1.0, r: 16, color: '#b4442f',
+  grunt:   { name: 'Raider',        hp: 60,   speed: 52,  armor: 0,    coins: 3,  hit: 9,  hitEvery: 1.0, r: 16, color: '#b4442f',
              tip: 'Basic foot soldier.' },
-  runner:  { name: 'Cutpurse',      hp: 61,   speed: 104, armor: 0,    bounty: 5,   hit: 6,  hitEvery: 0.8, r: 13, color: '#3f6e33',
+  runner:  { name: 'Cutpurse',      hp: 34,   speed: 104, armor: 0,    coins: 2,  hit: 6,  hitEvery: 0.8, r: 13, color: '#3f6e33',
              tip: 'Fast but fragile.' },
-  shield:  { name: 'Shieldbearer',  hp: 198,  speed: 40,  armor: 0.5,  bounty: 10,  hit: 12, hitEvery: 1.0, r: 18, color: '#55657f',
-             tip: 'Armor blocks half of physical damage. Magic ignores it.' },
-  brute:   { name: 'Brute',         hp: 576,  speed: 30,  armor: 0.15, bounty: 24,  hit: 38, hitEvery: 1.3, r: 26, color: '#8a5a3c',
-             tip: 'Slow and tough. Hits the wall very hard.' },
-  harpy:   { name: 'Harpy',         hp: 80,   speed: 66,  armor: 0,    bounty: 7,   hit: 7,  hitEvery: 0.9, r: 15, color: '#6a5a7a',
-             flying: true, tip: 'Flies straight at the wall. Cannons can’t hit it!' },
-  shaman:  { name: 'Shaman',        hp: 150,  speed: 40,  armor: 0,    bounty: 14,  hit: 6,  hitEvery: 1.0, r: 17, color: '#2f8a7a',
+  shield:  { name: 'Shieldbearer',  hp: 110,  speed: 40,  armor: 0.3,  coins: 4,  hit: 12, hitEvery: 1.0, r: 18, color: '#55657f',
+             tip: 'Armor blocks part of each arrow. Upgrade your bow!' },
+  brute:   { name: 'Brute',         hp: 320,  speed: 30,  armor: 0.1,  coins: 10, hit: 38, hitEvery: 1.3, r: 26, color: '#8a5a3c',
+             tip: 'Slow and tough. Smashes barricades fast.' },
+  harpy:   { name: 'Harpy',         hp: 45,   speed: 66,  armor: 0,    coins: 3,  hit: 7,  hitEvery: 0.9, r: 15, color: '#6a5a7a',
+             flying: true, tip: 'Flies over barricades, straight at the Keep!' },
+  shaman:  { name: 'Shaman',        hp: 90,   speed: 40,  armor: 0,    coins: 5,  hit: 6,  hitEvery: 1.0, r: 17, color: '#2f8a7a',
              heal: 0.08, healEvery: 3.5, healRange: 115, tip: 'Heals nearby foes. Take it down first!' },
-  xbow:    { name: 'Crossbowman',   hp: 150,  speed: 44,  armor: 0.25, bounty: 12,  hit: 14, hitEvery: 1.8, r: 16, color: '#7a5a34',
-             ranged: 230, tip: 'Stops at range and shoots the wall.' },
-  warlord: { name: 'Warlord Grask', hp: 2100, speed: 24,  armor: 0.3,  bounty: 200, hit: 120, hitEvery: 1.4, r: 36, color: '#33323d',
+  xbow:    { name: 'Crossbowman',   hp: 85,   speed: 44,  armor: 0.15, coins: 4,  hit: 14, hitEvery: 1.8, r: 16, color: '#7a5a34',
+             ranged: 230, tip: 'Shoots from range, at you too. Dodge the bolts!' },
+  warlord: { name: 'Warlord Grask', hp: 1500, speed: 24,  armor: 0.25, coins: 60, hit: 80, hitEvery: 1.4, r: 36, color: '#33323d',
              boss: true, cry: true, tip: 'War cry makes nearby foes faster.' },
-  hexmother: { name: 'Hexmother Vyl', hp: 2300, speed: 22, armor: 0.1, bounty: 250, hit: 90, hitEvery: 1.4, r: 34, color: '#2b3a2a',
+  hexmother: { name: 'Hexmother Vyl', hp: 1600, speed: 22, armor: 0.1, coins: 70, hit: 60, hitEvery: 1.4, r: 34, color: '#2b3a2a',
              boss: true, summon: { type: 'runner', n: 2, every: 6 }, tip: 'Summons Cutpurses as she walks.' },
 };
 
-// Wall slots are left, centre, right in lineup order. `unlock`: stage id that must be cleared first.
-export const HEROES = [
-  {
-    id: 'wren', name: 'Wren', role: 'Ranger', color: '#4f9a4a',
-    range: 330, dmg: 18, dtype: 'phys', rate: 1.6, proj: 'arrow', projSpeed: 950,
-    skill: { id: 'storm', name: 'Arrow Storm', cd: 16, aim: true, radius: 115, dmg: 14, pulses: 8, desc: 'Rain arrows on an area' },
-  },
-  {
-    id: 'bram', name: 'Bram', role: 'Warden', color: '#4a74b8',
-    range: 225, dmg: 36, dtype: 'phys', rate: 0.8, proj: 'axe', projSpeed: 700,
-    skill: { id: 'shout', name: 'Bulwark Shout', cd: 24, aim: false, radius: 300, desc: 'Stun foes at the wall, repair it' },
-  },
-  {
-    id: 'ignis', name: 'Ignis', role: 'Pyromancer', color: '#9a52c4',
-    range: 285, dmg: 24, dtype: 'magic', rate: 0.7, proj: 'fireball', projSpeed: 560, splash: 55,
-    skill: { id: 'meteor', name: 'Meteor', cd: 22, aim: true, radius: 110, dmg: 160, burn: 15, desc: 'Huge fiery blast' },
-  },
-  {
-    id: 'vex', name: 'Vex', role: 'Stormcaller', color: '#3fb5c9', unlock: '1-3',
-    range: 300, dmg: 15, dtype: 'magic', rate: 0.9, proj: 'bolt', chain: 2, chainRange: 120, chainFalloff: 0.7,
-    skill: { id: 'thunder', name: 'Thunderstorm', cd: 24, aim: false, strikes: 10, dmg: 55, stun: 0.6, dur: 3, desc: 'Lightning strikes all over the field' },
-  },
-];
-
-// air: false = cannot target flying enemies. pulse: hits everything in range at once (no projectile).
-export const TOWERS = {
-  arrow: {
-    name: 'Arrow Tower', short: 'Arrows', dtype: 'phys', proj: 'arrow', projSpeed: 900, air: true,
-    levels: [
-      { cost: 60,  dmg: 14, rate: 1.5, range: 210 },
-      { cost: 70,  dmg: 22, rate: 1.8, range: 225 },
-      { cost: 110, dmg: 34, rate: 2.1, range: 240 },
-    ],
-  },
-  cannon: {
-    name: 'Cannon', short: 'Cannon', dtype: 'phys', proj: 'ball', projSpeed: 480, air: false,
-    levels: [
-      { cost: 90,  dmg: 40,  rate: 0.5,  range: 190, splash: 60 },
-      { cost: 100, dmg: 65,  rate: 0.55, range: 195, splash: 70 },
-      { cost: 150, dmg: 100, rate: 0.6,  range: 210, splash: 80 },
-    ],
-  },
-  frost: {
-    name: 'Frost Spire', short: 'Frost', dtype: 'magic', pulse: true, air: true,
-    levels: [
-      { cost: 70,  dmg: 6,  rate: 0.8, range: 150, slow: 0.3 },
-      { cost: 80,  dmg: 10, rate: 0.9, range: 162, slow: 0.4 },
-      { cost: 120, dmg: 16, rate: 1.0, range: 175, slow: 0.5 },
-    ],
-  },
-  mage: {
-    name: 'Arcane Tower', short: 'Arcane', dtype: 'magic', proj: 'arcane', projSpeed: 650, air: true,
-    levels: [
-      { cost: 100, dmg: 30, rate: 0.8,  range: 200 },
-      { cost: 110, dmg: 48, rate: 0.85, range: 210 },
-      { cost: 160, dmg: 75, rate: 0.9,  range: 225 },
-    ],
-  },
+// The King: the one character you control.
+export const KING = {
+  r: 16, speed: 230, hp: 200, regen: 8, regenDelay: 3, respawn: 5,
+  range: 240, dmg: 22, rate: 2.0, arrowSpeed: 1000, magnet: 75,
+  kingHit: 0.6, // enemies deal this fraction of their `hit` to the King
 };
+
+// Watch tower: shoots arrows. Levels are bought one after another on the same spot.
+export const TOWER = {
+  name: 'Watch Tower',
+  levels: [
+    { cost: 25, dmg: 18, rate: 1.5, range: 210 },
+    { cost: 40, dmg: 28, rate: 1.8, range: 225 },
+    { cost: 60, dmg: 42, rate: 2.1, range: 240 },
+  ],
+};
+
+// Barricade: sits across the road. Enemies must break it to pass. Rebuild if destroyed.
+export const BARRICADE = {
+  name: 'Barricade',
+  levels: [
+    { cost: 20, hp: 350 },
+    { cost: 35, hp: 700 },
+    { cost: 55, hp: 1200 },
+  ],
+};
+
+// Armory spots in front of the Keep: upgrade the King for this battle.
+export const ARMORY = {
+  bow:    { name: 'Bow',    desc: '+20% arrow damage', costs: [30, 55, 90], per: 0.2 },
+  quiver: { name: 'Quiver', desc: 'Shoot 15% faster',  costs: [30, 55, 90], per: 0.15 },
+  volley: { name: 'Volley', desc: '+1 extra arrow (half damage)', costs: [60, 110, 160], extraDmg: 0.5 },
+  repair: { name: 'Repair', desc: 'Keep +150 HP',      cost: 20, amount: 150 },
+};
+
+export const KEEP_HP = 1000;
+export const PAY_RATE = 30;   // coins per second while standing on a spot
+export const PAY_DELAY = 0.3; // seconds of standing before coins start flowing
+export const COIN_LIFE = 25;  // seconds before dropped coins vanish

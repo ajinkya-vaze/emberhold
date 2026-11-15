@@ -1,7 +1,7 @@
 // Offline support. Strategy: network first (so updates arrive as soon as you're online),
 // falling back to the cached copy when offline or when the network is too slow.
 // Bump VERSION when the file list changes; tools/check_sw.py verifies the list.
-const VERSION = 'emberhold-v1';
+const VERSION = 'emberhold-v2';
 const CORE = [
   './',
   './index.html',
@@ -12,7 +12,6 @@ const CORE = [
   './icons/icon-512.png',
   './src/art.js',
   './src/audio.js',
-  './src/data/boons.js',
   './src/data/stages.js',
   './src/data/units.js',
   './src/main.js',

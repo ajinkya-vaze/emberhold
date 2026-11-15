@@ -1,12 +1,12 @@
 import { view } from '../view.js';
 import { STAGES, ENDLESS } from '../data/stages.js';
-import { ENEMIES, HEROES } from '../data/units.js';
+import { ENEMIES } from '../data/units.js';
 import { button, text, star, panel, roundRect, wrapText } from '../ui.js';
-import { drawEnemy, drawPortrait } from '../art.js';
+import { drawEnemy, drawKing } from '../art.js';
 import { inRect, rng, TAU } from '../util.js';
 import { audio } from '../audio.js';
 import { save } from '../save.js';
-import { stageUnlocked, endlessUnlocked, unlockedHeroes, heroUnlocked, totalStars } from '../progress.js';
+import { stageUnlocked, endlessUnlocked, totalStars } from '../progress.js';
 
 const ENDLESS_NODE = [150, 0.1];
 
@@ -27,7 +27,7 @@ export class Campaign {
 
   resize() {
     const { W, H, safeTop, safeBottom } = view;
-    this.panelH = 470 + safeBottom;
+    this.panelH = 445 + safeBottom;
     this.mapTop = safeTop + 110;
     this.mapBot = H - this.panelH - 10;
     this.bg = this.renderMap(W, H);
@@ -209,52 +209,18 @@ export class Campaign {
     text(ctx, tipText, W / 2, y, { size: tipText.length > 52 ? 15 : 17, color: this.tip ? '#ffe9a8' : '#a8957a', weight: 700 });
     y += 22;
 
-    // hero lineup
-    const heroes = unlockedHeroes();
-    const lu = save.data.lineup.filter((id) => heroes.some((h) => h.id === id));
-    text(ctx, 'Heroes', 44, y + 40, { size: 18, align: 'left', color: '#d9c3a0', weight: 800 });
-    const hs = 92;
-    const hx0 = W / 2 - ((HEROES.length - 1) * hs) / 2 + 30;
-    HEROES.forEach((h, i) => {
-      const cx = hx0 + i * hs, cy = y + 42;
-      const unlocked = heroUnlocked(h);
-      const pos = lu.indexOf(h.id);
-      ctx.save();
-      if (!unlocked || pos < 0) ctx.globalAlpha = unlocked ? 0.45 : 0.25;
-      drawPortrait(ctx, h.id, cx, cy, 34);
-      ctx.restore();
-      ctx.beginPath(); ctx.arc(cx, cy, 34, 0, TAU);
-      ctx.lineWidth = pos >= 0 ? 5 : 3; ctx.strokeStyle = pos >= 0 ? '#ffd34d' : '#1e140f'; ctx.stroke();
-      if (!unlocked) {
-        text(ctx, '🔒', cx, cy, { size: 22 });
-      } else if (pos >= 0) {
-        ctx.beginPath(); ctx.arc(cx + 26, cy - 26, 13, 0, TAU); ctx.fillStyle = '#e8a52a'; ctx.fill();
-        text(ctx, ['L', 'C', 'R'][pos], cx + 26, cy - 25, { size: 15, color: '#2a1606' });
-      }
-      text(ctx, h.name, cx, cy + 48, { size: 15, color: unlocked ? '#fff3d6' : '#8a7a6a', weight: 700 });
-      if (unlocked) {
-        this.addHit({ x: cx - 40, y: cy - 40, w: 80, h: 96 }, () => {
-          const cur = save.data.lineup.filter((id) => heroes.some((hh) => hh.id === id));
-          const at = cur.indexOf(h.id);
-          if (at >= 0) cur.splice(at, 1);
-          else if (cur.length < 3) cur.push(h.id);
-          else { audio.play('error'); return; }
-          save.data.lineup = cur;
-          save.write();
-          audio.play('click');
-        });
-      }
-    });
-    y += 108;
-    if (heroes.length > 3) {
-      text(ctx, 'Pick 3. Wall positions: L, C, R in the order you pick.', W / 2, y, { size: 15, color: '#a8957a', weight: 700 });
-    }
+    // how to play
+    ctx.save();
+    ctx.translate(72, y + 66);
+    drawKing(ctx, { x: 0, y: 0, aim: -0.6, moving: false, walk: 0, anim: 0, hurt: 0 }, this.t);
+    ctx.restore();
+    const tips = ['Drag to move the King: he shoots the nearest foe.', 'Walk over coins to collect them.', 'Stand on a spot to build towers & barricades.'];
+    tips.forEach((tp, i) => text(ctx, tp, 112, y + 28 + i * 26, { size: 16, align: 'left', color: '#d9c3a0', weight: 700 }));
 
-    const ready = lu.length === 3;
     const b = { x: W / 2 - 180, y: H - view.safeBottom - 96, w: 360, h: 78 };
     const label = endless ? 'Start Siege' : (save.data.best[st.id] ? 'Play Again' : 'Battle!');
-    button(ctx, b, ready ? label : 'Pick 3 heroes', { color: 'green', size: 32, disabled: !ready });
-    if (ready) this.addHit(b, () => { audio.play('click'); this.game.go('battle', this.sel); });
+    button(ctx, b, label, { color: 'green', size: 32 });
+    this.addHit(b, () => { audio.play('click'); this.game.go('battle', this.sel); });
   }
 
   pointerDown(x, y) {

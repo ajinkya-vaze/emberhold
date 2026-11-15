@@ -1,69 +1,108 @@
-// Headless balance harness. In the browser console on the running game:
+// Headless balance harness. In the browser console on the running game (NOT a tab you're playing in):
 //   const B = await import('/tools/balance.js');
-//   B.report(2)              // stage index 2 (= stage 1-3), 3 runs per strategy
-//   B.all()                  // every stage, quick summary
-//   B.endless()              // how far each strategy gets in Endless Siege
-// Plays the battle with bot strategies and prints wall HP after each wave.
+//   B.all(2)        // every stage, every strategy, 2 runs each
+//   B.report(0)     // one stage (index 0 = 1-1), with Keep HP after each wave
+//   B.endless()     // how far each strategy gets in Endless Siege
+// A bot steers the King: grabs coins, stands on spots to build, retreats when hurt.
 import { STAGES } from '../src/data/stages.js';
-import { TOWERS } from '../src/data/units.js';
 import { save } from '../src/save.js';
 
-// Bot strategies. `types: 'all'` cycles through every tower the stage allows.
+// Build orders: [kind, level, howMany] (howMany = only the N spots nearest the Keep).
+const BALANCED = [
+  ['wall', 1, 1], ['tower', 1, 2], ['bow', 1], ['wall', 1], ['tower', 1], ['quiver', 1], ['volley', 1],
+  ['tower', 2], ['wall', 2, 1], ['bow', 2], ['quiver', 2], ['repair'], ['tower', 3], ['volley', 2],
+  ['wall', 2], ['bow', 3], ['quiver', 3], ['volley', 3], ['wall', 3], ['repair'],
+];
+const BUILDINGS_ONLY = BALANCED.filter(([k]) => k === 'wall' || k === 'tower' || k === 'repair');
+const KING_ONLY = BALANCED.filter(([k]) => !['wall', 'tower'].includes(k));
+
 export const STRATEGIES = [
-  { name: 'expert',      types: 'all',               pads: 9, maxLv: 3, skills: true,  boons: ['steel', 'ember', 'quick', 'eng', 'keen', 'focus'] },
-  { name: 'casual',      types: 'all',               pads: 9, maxLv: 2, skills: true,  boons: [] },
-  { name: 'arrows-only', types: ['arrow'],           pads: 9, maxLv: 2, skills: true,  boons: [] },
-  { name: '3towers',     types: 'all',               pads: 3, maxLv: 3, skills: true,  boons: [] },
-  { name: 'no-skills',   types: 'all',               pads: 9, maxLv: 3, skills: false, boons: [] },
-  { name: 'heroes-only', types: [],                  pads: 0, maxLv: 1, skills: true,  boons: ['quick'] },
+  { name: 'expert',     order: BALANCED,       collect: 2000, retreat: 0.35 },
+  { name: 'casual',     order: BALANCED,       collect: 260,  retreat: 0.2 },
+  { name: 'buildings',  order: BUILDINGS_ONLY, collect: 2000, retreat: 0.35 },
+  { name: 'king-only',  order: KING_ONLY,      collect: 2000, retreat: 0.35 },
+  { name: 'idle',       order: [],             collect: 0,    retreat: 0, fight: false },
 ];
 
+function levelOf(b, sp) { return ['bow', 'quiver', 'volley'].includes(sp.kind) ? b.up[sp.kind] : sp.level; }
+
+function nextBuy(b, order) {
+  for (const [kind, lvl, n] of order) {
+    if (kind === 'repair') {
+      if (b.keepHp < b.keepMax * 0.7) return b.spots.find((s) => s.kind === 'repair');
+      continue;
+    }
+    let cands = b.spots.filter((s) => s.kind === kind);
+    if (n) cands = cands.sort((a, c) => dist(a, b.keepPt()) - dist(c, b.keepPt())).slice(0, n);
+    const sp = cands.filter((s) => levelOf(b, s) < lvl && b.spotCost(s) !== null)
+      .sort((a, c) => dist(a, b.king) - dist(c, b.king))[0];
+    if (sp) return sp;
+  }
+  return null;
+}
+const dist = (a, c) => Math.hypot(a.x - c.x, a.y - c.y);
+
+function botStep(b, st) {
+  const k = b.king;
+  b.keepPt = () => ({ x: 360, y: b.townTop });
+  if (k.dead) { b.autoMove = { x: 0, y: 0 }; return; }
+  const want = nextBuy(b, st.order);
+  const need = want ? b.spotCost(want) - want.paid : Infinity;
+  let target = null;
+  if (st.retreat && k.hp < k.maxHp * st.retreat) target = { x: 360, y: b.townBottom - 20 };
+  else if (want && b.coins >= need) target = want;
+  else {
+    const coin = b.drops.filter((c) => dist(c, k) < st.collect).sort((a, c) => dist(a, k) - dist(c, k))[0];
+    if (coin) target = coin;
+    else if (want && b.coins > 0 && b.phase !== 'wave') target = want; // part-pay between waves
+    else {
+      // fight: stand ~180px from the most advanced enemy, on the Keep side (in bow range, out of sword reach)
+      const lead = b.findTarget(k.x, k.y, 5000);
+      if (lead && st.fight !== false) {
+        const ax = k.x - lead.x, ay = k.y - lead.y, al = Math.hypot(ax, ay) || 1;
+        target = { x: lead.x + (ax / al) * 180, y: lead.y + (ay / al) * 180 };
+      } else target = { x: 360, y: b.townTop - 120 };
+    }
+  }
+  const dx = target.x - k.x, dy = target.y - k.y, len = Math.hypot(dx, dy);
+  b.autoMove = len < 6 ? { x: 0, y: 0 } : { x: dx / len, y: dy / len };
+  // start waves once there is nothing useful to do
+  const idle = !want || b.coins < need;
+  if (b.phase === 'prep' && idle) b.callWave();
+  if (b.phase === 'inter' && idle && !b.drops.length) b.callWave();
+}
+
 // Plays one battle without touching your saved progress.
-export function play(which, st, maxSteps = 60 * 60 * 30) {
+export function play(which, st, maxSteps = 60 * 60 * 40) {
   const backup = JSON.stringify(save.data);
   const g = window.__game;
   g.go('battle', which);
   const b = g.scene;
-  const types = st.types === 'all' ? b.stage.towers : st.types.filter((t) => b.stage.towers.includes(t));
-  const walls = [];
-  let lastWave = 0;
+  const keeps = [];
+  let lastWave = 0, deaths = 0, wasDead = false;
   for (let steps = 0; b.phase !== 'end' && steps < maxSteps; steps++) {
-    if (b.wave !== lastWave) { walls.push(Math.round(b.wallHp)); lastWave = b.wave; }
-    if (b.phase === 'prep') b.callWave();
-    if (b.phase === 'boon') { const c = b.boonChoices; b.chooseBoon(c.find((x) => st.boons.includes(x.id)) || c[0]); }
-    for (let i = 0; i < Math.min(b.pads.length, st.pads); i++) {
-      const ty = types[i % types.length];
-      if (!b.towerAt(i) && ty && b.gold >= TOWERS[ty].levels[0].cost) b.build(i, ty);
-    }
-    for (const t of b.towers) {
-      const next = TOWERS[t.type].levels[t.level];
-      if (t.level < st.maxLv && next && b.gold >= next.cost) b.upgrade(t);
-    }
-    if (st.skills) {
-      b.heroes.forEach((h, i) => {
-        const tg = b.findTarget(360, b.wallY, 5000);
-        if (h.cd > 0 || !tg) return;
-        if (h.def.skill.aim) b.castSkill(i, tg.x, tg.y);
-        else if (h.def.skill.id === 'thunder' ? b.enemies.length >= 5 : b.enemies.filter((e) => e.state === 'attack').length >= 3) b.castSkill(i, 0, 0);
-      });
-    }
+    if (b.wave !== lastWave) { keeps.push(Math.round(b.keepHp)); lastWave = b.wave; }
+    if (steps % 6 === 0) botStep(b, st);
+    if (b.king.dead && !wasDead) deaths++;
+    wasDead = b.king.dead;
     b.step(1 / 60);
   }
+  for (const key of Object.keys(save.data)) delete save.data[key];
   Object.assign(save.data, JSON.parse(backup));
   save.write();
-  return { win: !!b.result?.win, stars: b.result?.stars || 0, wave: b.wave, wall: Math.round(b.wallHp), walls };
+  return { win: !!b.result?.win, stars: b.result?.stars || 0, wave: b.wave, keep: Math.round(b.keepHp), keeps, deaths, up: { ...b.up } };
 }
 
-export function report(stageIdx, runs = 3) {
+export function report(stageIdx, runs = 2) {
   const lines = [`Stage ${STAGES[stageIdx].id} ${STAGES[stageIdx].name}`];
   for (const st of STRATEGIES) {
     const rs = [];
     for (let r = 0; r < runs; r++) {
       const o = play(stageIdx, st);
-      rs.push(o.win ? `W${o.stars}★` : `L@w${o.wave}`);
-      if (r === 0) rs.push(`[${o.walls.join(',')}]`);
+      rs.push(`${o.win ? `W${o.stars}★` : `L@w${o.wave}`}(deaths ${o.deaths})`);
+      if (r === 0) rs.push(`[${o.keeps.join(',')}]`);
     }
-    lines.push(`  ${st.name.padEnd(12)} ${rs.join(' ')}`);
+    lines.push(`  ${st.name.padEnd(10)} ${rs.join(' ')}`);
   }
   window.__game.go('menu');
   return lines.join('\n');

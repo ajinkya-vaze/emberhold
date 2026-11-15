@@ -1,4 +1,16 @@
-# Emberhold — Game Spec (v0.2)
+# Emberhold — Game Spec (v0.3)
+
+> **v0.3 battle redesign (current).** The static heroes, skill cards, extra tower types and boons are gone. You now control **the King** directly.
+>
+> - **Movement:** drag to move him. He auto-shoots arrows at the nearest enemy.
+> - **Coins:** killed enemies drop coins, which he must walk over to collect.
+> - **Building:** stand on a spot to spend coins.
+>   - Watch towers (arrows) beside the road.
+>   - Barricades across the road, which enemies must break through.
+>   - Armory upgrades for the King (Bow, Quiver, Volley) and Keep repair.
+> - **Enemies:** they fight the King when he's close. Crossbowmen shoot at him, and he can dodge. The goal is protecting the Keep.
+>
+> Sections 8–10 below describe the earlier design and are kept for reference; the town/economy plan (M2+) still applies.
 
 *Working title. An original, ad-free, offline, single-player game for iPhone, inspired by the genre of Kingshot (Century Games). We reuse the genre and the kind of mechanics only. We do not copy its name, heroes, story, art, UI, or music.*
 
@@ -174,6 +186,7 @@ There are three short branches of about 12 nodes each, with timed research:
 |---|---|---|
 | M1 ✅ | **Battle prototype** | One stage: paths, 4 enemy types, 3 heroes with skills, 2 tower types, waves, boons, win/lose |
 | M1.5 ✅ | **Battle content** | Chapter 1 campaign (6 stages), Endless Siege, 4 new enemies (flyer, healer, ranged, 2nd boss), Frost Spire and Arcane towers, 4th hero Vex, hero lineup |
+| M1.6 ✅ | **King redesign** | Player-controlled King, coin drops and pickup, stand-to-build towers, barricades and armory, Keep defense |
 | M2 | **Town and economy** | Buildings, resources, timers, idle/offline income, saving |
 | M3 | **Heroes and troops** | Shards, levels, stars, Tavern, training, troops in battle |
 | M4 | **Survivors, laws, research** | Roles, health, happiness, laws, Academy tree |

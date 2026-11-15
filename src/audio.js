@@ -4,7 +4,7 @@ let master = null;
 let noiseBuf = null;
 let enabled = true;
 const lastPlayed = {};
-const MIN_GAP = { bow: 0.06, hit: 0.05, coin: 0.07, wall: 0.18, fire: 0.08, cannon: 0.08, frost: 0.15, zap: 0.06, arcane: 0.08, heal: 0.3, ebolt: 0.1, thunder: 0.12 };
+const MIN_GAP = { bow: 0.06, hit: 0.05, coin: 0.07, wall: 0.18, fire: 0.08, cannon: 0.08, frost: 0.15, zap: 0.06, arcane: 0.08, heal: 0.3, ebolt: 0.1, thunder: 0.12, hurt: 0.15, pay: 0.05, pickup: 0.04 };
 
 function tone(t, { type = 'sine', f0, f1, dur, vol = 0.3, attack = 0.005 }) {
   const o = ac.createOscillator();
@@ -104,6 +104,17 @@ const SFX = {
     noise(t, { dur: 0.08, vol: 0.25, freq: 4000, type: 'highpass' });
   },
   ebolt: (t) => noise(t, { dur: 0.06, vol: 0.08, freq: 2200, q: 3 }),
+  hurt: (t) => {
+    tone(t, { type: 'square', f0: 220, f1: 110, dur: 0.15, vol: 0.06 });
+    noise(t, { dur: 0.1, vol: 0.12, freq: 700 });
+  },
+  pay: (t) => tone(t, { type: 'triangle', f0: 1200, f1: 1500, dur: 0.04, vol: 0.04 }),
+  pickup: (t) => tone(t, { type: 'sine', f0: 1320, f1: 1760, dur: 0.07, vol: 0.06 }),
+  smash: (t) => {
+    noise(t, { dur: 0.45, vol: 0.35, freq: 500, f1: 120, type: 'lowpass' });
+    tone(t, { type: 'triangle', f0: 160, f1: 60, dur: 0.3, vol: 0.2 });
+  },
+  respawn: (t) => notes(t, [523, 659, 784], 0.09, 0.25, 0.1),
 };
 
 export const audio = {

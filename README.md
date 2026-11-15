@@ -2,19 +2,19 @@
 
 An ad-free, offline tower-defense game for iPhone, built as a web app. See [SPEC.md](SPEC.md) for the full design.
 
-**Status:** Milestone 1 plus a battle-content expansion.
+**Status:** playable campaign (6 stages) plus Endless Siege.
 
-- **Campaign:** Chapter 1 has 6 stages on a campaign map. Each stage unlocks the next, and you earn 1–3 stars per stage.
-- **Endless Siege:** generated waves with a boss every 10 waves. Unlocks after stage 1-3.
-- **Enemies (9):**
-  - Raider, Cutpurse, Shieldbearer and Brute.
-  - Harpy: flies straight at the wall; cannons can't hit it.
-  - Shaman: heals nearby enemies.
-  - Crossbowman: shoots the wall from range.
-  - Bosses: Warlord Grask (war cry speeds up nearby enemies) and Hexmother Vyl (summons Cutpurses).
-- **Towers (4):** Arrow, Cannon, Frost Spire (slows) and Arcane (magic damage that ignores armor), each with 3 levels.
-- **Heroes (4):** Wren, Bram and Ignis, plus Vex the Stormcaller (chain lightning), unlocked by clearing 1-3. You pick 3 heroes for the wall on the map screen.
-- **Boons:** 17, offered between waves.
+**How a battle works:**
+
+- **Move the King:** drag anywhere on the screen, or use arrow keys / WASD on a computer. He automatically shoots arrows at the **nearest** enemy, so where you stand decides what he hits.
+- **Fighting:** enemies who reach the King stop and fight him. Crossbowmen fire bolts at where he's standing; keep moving and they miss. If he falls, he drops a quarter of his coins and comes back at the Keep 5 seconds later.
+- **Coins:** killed enemies drop coins. Walk near them to collect them; they vanish after 25 seconds.
+- **Building:** stand on a spot and coins flow into it.
+  - **Watch towers** sit beside the road and shoot arrows. They have 3 levels.
+  - **Barricades** go on the road, and enemies must smash through them. They have 3 levels; rebuild them when broken.
+  - **Armory**, in front of the Keep: Bow (more damage), Quiver (faster shots), Volley (extra arrows), and Repair for the Keep.
+- **Goal:** protect the Keep. You earn up to 3 stars per stage, based on how much Keep HP is left.
+- **Enemies (9):** Raider, Cutpurse, Shieldbearer, Brute, Harpy (flies over barricades), Shaman (heals), Crossbowman (ranged), and two bosses: Warlord Grask and Hexmother Vyl.
 
 ## Run it
 
@@ -62,12 +62,12 @@ Progress is saved inside the home-screen app and is separate from anything you p
 | `src/main.js` | Canvas setup, game loop, input |
 | `src/scenes/battle.js` | Battle simulation, rendering, UI |
 | `src/scenes/menu.js` | Title screen |
-| `src/data/` | Enemies, heroes, towers (`units.js`), stages and the endless wave generator (`stages.js`), boons. **Tune balance here.** Each stage has an `hpMul` difficulty setting |
-| `src/scenes/campaign.js` | Campaign map, stage details, hero lineup |
-| `src/progress.js` | Unlock rules for stages, heroes and Endless mode |
+| `src/data/` | Enemies, the King, towers, barricades, armory (`units.js`); stages and the endless wave generator (`stages.js`). **Tune balance here.** Each stage has an `hpMul` difficulty setting |
+| `src/scenes/campaign.js` | Campaign map and stage details |
+| `src/progress.js` | Unlock rules for stages and Endless mode |
 | `src/art.js` | All sprites, drawn in code |
 | `src/audio.js` | Synthesized sound effects |
-| `tools/balance.js` | Headless bot that plays the battle with 6 strategies to check difficulty |
+| `tools/balance.js` | Headless bot that steers the King through battles to check difficulty |
 | `sw.js`, `manifest.webmanifest`, `icons/` | Offline support and home-screen app setup |
 | `tools/make-icons.html` | Redraws the app icons (open it on the local dev server) |
 
@@ -77,9 +77,9 @@ In the browser console on the running game:
 
 ```js
 const B = await import('/tools/balance.js');
-B.all(3)        // every stage, 6 bot strategies, 3 runs each
-B.report(2)     // one stage (index 2 = stage 1-3), with wall HP after each wave
+B.all(3)        // every stage, 5 bot strategies, 3 runs each
+B.report(2)     // one stage (index 2 = stage 1-3), with Keep HP after each wave
 B.endless()     // how far each strategy gets in Endless Siege
 ```
 
-The bot restores your saved progress after each run. It switches scenes, so don't run it in a tab you're playing in.
+The bot steers the King itself: it collects coins, follows a build order, fights from bow range, and retreats when hurt. Its strategies are `expert`, `casual`, `buildings` (no King upgrades), `king-only` (no towers or barricades) and `idle`. It restores your saved progress after each run. It switches scenes, so don't run it in a tab you're playing in.

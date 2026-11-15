@@ -47,14 +47,29 @@ function toLogical(e) {
 canvas.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   audio.unlock();
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
   const [x, y] = toLogical(e);
-  game.scene.pointerMove?.(x, y);
-  game.scene.pointerDown?.(x, y);
+  game.scene.pointerDown?.(x, y, e.pointerId);
 });
 canvas.addEventListener('pointermove', (e) => {
   const [x, y] = toLogical(e);
-  game.scene.pointerMove?.(x, y);
+  game.scene.pointerMove?.(x, y, e.pointerId);
 });
+const release = (e) => game.scene.pointerUp?.(e.pointerId);
+canvas.addEventListener('pointerup', release);
+canvas.addEventListener('pointercancel', release);
+
+// Keyboard (for playing on a computer): arrows or WASD move the King.
+const KEYS = { ArrowLeft: 'left', a: 'left', A: 'left', ArrowRight: 'right', d: 'right', D: 'right',
+  ArrowUp: 'up', w: 'up', W: 'up', ArrowDown: 'down', s: 'down', S: 'down' };
+window.addEventListener('keydown', (e) => {
+  const k = KEYS[e.key];
+  if (!k) return;
+  e.preventDefault();
+  audio.unlock();
+  game.scene.keyDown?.(k);
+});
+window.addEventListener('keyup', (e) => { const k = KEYS[e.key]; if (k) game.scene.keyUp?.(k); });
 document.addEventListener('gesturestart', (e) => e.preventDefault());
 document.addEventListener('visibilitychange', () => { if (document.hidden) game.scene?.onHide?.(); });
 window.addEventListener('resize', resize);

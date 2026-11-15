@@ -1,16 +1,21 @@
 import { view } from '../view.js';
-import { ENEMIES, TOWERS } from '../data/units.js';
-import { BOONS, baseMods } from '../data/boons.js';
+import { ENEMIES, KING, TOWER, BARRICADE, ARMORY, PAY_RATE, PAY_DELAY, COIN_LIFE } from '../data/units.js';
 import { STAGES, ENDLESS, genEndlessWave } from '../data/stages.js';
-import { Path, clamp, dist2, smooth, rand, shuffle, inRect, TAU } from '../util.js';
-import { drawEnemy, drawHero, drawPortrait, drawPad, drawTower, drawWall, drawLightning, renderBackground, shadow } from '../art.js';
-import { roundRect, text, button, panel, star, coin } from '../ui.js';
+import { Path, clamp, dist2, smooth, rand, inRect, TAU } from '../util.js';
+import {
+  drawEnemy, drawKing, drawPad, drawCostBubble, drawCoin, drawCoinIcon, drawTower, drawBarricade,
+  drawKeep, drawArmorySpot, renderBackground,
+} from '../art.js';
+import { roundRect, text, button, panel, star } from '../ui.js';
 import { audio } from '../audio.js';
 import { save } from '../save.js';
-import { lineup, cleared, unlocksFrom } from '../progress.js';
+import { cleared, unlocksFrom } from '../progress.js';
 
 // Point projectiles aim at: body centre, lifted for flyers.
 const aimY = (e) => e.y - (e.alt || 0) - e.r * 0.6;
+const ARMORY_KINDS = ['bow', 'quiver', 'volley', 'repair'];
+const KEEP_W = 230; // keep footprint (for collisions)
+const KEEP_H = 170;
 
 export class Battle {
   // which: stage index (0-based) or 'endless'
@@ -21,6 +26,7 @@ export class Battle {
     this.stage = this.endless ? ENDLESS : STAGES[which];
     this.speed = 1;
     this.hits = [];
+    this.keys = new Set();
     this.reset();
   }
 
@@ -28,60 +34,75 @@ export class Battle {
   reset() {
     const s = this.stage;
     this.time = 0;
-    this.gold = s.startGold;
-    this.wallMax = s.wallHp;
-    this.wallHp = s.wallHp;
+    this.simTime = 0; // advances with the simulation (respects 2× speed)
+    this.coins = s.startCoins;
+    this.keepMax = s.keepHp;
+    this.keepHp = s.keepHp;
     this.wave = 0;
     this.totalWaves = this.endless ? Infinity : s.waves.length;
-    this.phase = 'prep'; // prep | wave | inter | boon | end
+    this.phase = 'prep'; // prep | wave | inter | end
     this.paused = false;
     this.enemies = [];
     this.projectiles = [];
     this.particles = [];
     this.texts = [];
     this.effects = [];
+    this.drops = [];
     this.spawnQueue = [];
     this.waveTime = 0;
     this.interT = 0;
-    this.mods = baseMods();
-    this.boonsTaken = [];
     this.kills = 0;
-    this.towers = [];
-    this.selected = -1;
-    this.aiming = -1;
-    this.aimX = 360;
-    this.aimY = 600;
-    this.boonChoices = null;
     this.result = null;
     this.shake = 0;
-    this.wallFlash = 0;
-    this.flash = 0;
+    this.keepFlash = 0;
     this.banner = null;
     this.seen = new Set();
     this.pathTurn = 0;
+    this.joy = null;
+    this.autoMove = null; // set by the balance bot
+    this.onSpot = null;
     this.wasCleared = !this.endless && cleared(s.id);
-    this.heroes = lineup().map((def, i) => ({
-      def, i, x: 0, y: 0, cd: def.skill.cd * 0.5, atk: 0.3 + i * 0.2, anim: 0, angle: -Math.PI / 2,
-    }));
-    this.layout();
+    this.up = { bow: 0, quiver: 0, volley: 0 };
+    this.king = {
+      x: 360, y: 0, hp: KING.hp, maxHp: KING.hp, aim: -Math.PI / 2, moving: false, walk: 0,
+      anim: 0, hurt: 0, atk: 0, dead: false, respawnT: 0, lastHurt: -99,
+    };
+    // build spots: towers beside the road, barricades on it, armory in town
+    this.spots = [
+      ...s.pads.map(([fx, ff]) => ({ kind: 'tower', fx, ff, level: 0, paid: 0, acc: 0, dwell: 0, atk: 0.3, anim: 0 })),
+      ...s.walls.map(([fx, ff]) => ({ kind: 'wall', fx, ff, level: 0, paid: 0, acc: 0, dwell: 0, hp: 0, maxHp: 0, hit: 0 })),
+      ...ARMORY_KINDS.map((kind, i) => ({ kind, slot: i, level: 0, paid: 0, acc: 0, dwell: 0 })),
+    ];
+    this.layout(true);
   }
 
-  layout() {
+  layout(first = false) {
     const { W, H, safeTop, safeBottom } = view;
     this.fieldTop = safeTop + 96;
-    this.panelTop = H - (196 + safeBottom);
-    this.wallY = this.panelTop - 84;
-    const fy = (f) => this.fieldTop + f * (this.wallY - this.fieldTop);
+    this.townBottom = H - safeBottom;
+    this.townTop = this.townBottom - 210;
+    const fy = (f) => this.fieldTop + f * (this.townTop - this.fieldTop);
     this.paths = this.stage.paths.map((p) => new Path(p.map(([x, f]) => [x, fy(f)])));
-    this.pads = this.stage.pads.map(([x, f]) => ({ x, y: fy(f) }));
-    for (const t of this.towers) { t.x = this.pads[t.pad].x; t.y = this.pads[t.pad].y; }
-    const hx = [150, 360, 570];
-    this.heroes.forEach((h, i) => { h.x = hx[i]; h.y = this.wallY + 24; });
+    const armX = [78, 196, 524, 642];
+    for (const sp of this.spots) {
+      if (sp.kind === 'tower') { sp.x = sp.fx; sp.y = fy(sp.ff); }
+      else if (sp.kind === 'wall') {
+        sp.x = sp.fx; sp.y = fy(sp.ff);
+        sp.blocks = [];
+        this.paths.forEach((P, pi) => {
+          const pr = P.project(sp.x, sp.y);
+          if (pr.dist < 6) { sp.blocks.push({ path: pi, d: pr.d }); sp.dx = pr.dx; sp.dy = pr.dy; }
+        });
+      } else { sp.x = armX[sp.slot]; sp.y = this.townTop + 118; }
+    }
+    this.keepRect = { x: 360 - KEEP_W / 2, y: this.townTop + 4, w: KEEP_W, h: KEEP_H };
+    if (first) { this.king.x = 360; this.king.y = this.townTop - 70; }
+    this.king.y = clamp(this.king.y, this.fieldTop + 20, this.townBottom - 24);
     for (const e of this.enemies) {
       if (e.flying) {
         const f = e.d / e.dEnd;
         e.fy0 = this.paths[e.path].pts[0][1];
-        e.fy1 = this.wallY - e.r - 34;
+        e.fy1 = this.townTop + 6;
         e.dEnd = Math.hypot(e.fx1 - e.fx0, e.fy1 - e.fy0);
         e.d = f * e.dEnd;
       } else {
@@ -90,11 +111,12 @@ export class Battle {
       }
       this.placeEnemy(e);
     }
-    this.bg = renderBackground(W, H, view.scale, view.dpr, this.paths, this.pads, this.fieldTop, this.wallY);
+    const clearSpots = this.spots.filter((s) => s.kind === 'tower' || s.kind === 'wall');
+    this.bg = renderBackground(W, H, view.scale, view.dpr, this.paths, clearSpots, this.fieldTop, this.townTop);
   }
 
   resize() { this.layout(); }
-  onHide() { if (this.phase !== 'end') this.paused = true; }
+  onHide() { if (this.phase !== 'end') this.paused = true; this.joy = null; this.keys.clear(); }
 
   // ------------------------------------------------------------ flow
   waveGroups(n) { return this.endless ? genEndlessWave(n) : this.stage.waves[n - 1]; }
@@ -103,68 +125,39 @@ export class Battle {
     this.wave++;
     const groups = this.waveGroups(this.wave);
     const q = [];
-    for (const g of groups) {
-      for (let i = 0; i < g.n; i++) q.push({ at: (g.delay || 0) + i * g.every, type: g.t, p: g.p });
-    }
+    for (const g of groups) for (let i = 0; i < g.n; i++) q.push({ at: (g.delay || 0) + i * g.every, type: g.t, p: g.p });
     q.sort((a, b) => a.at - b.at);
     this.spawnQueue = q;
     this.waveTime = 0;
     this.phase = 'wave';
     const boss = groups.some((g) => ENEMIES[g.t].boss);
-    const last = this.wave === this.totalWaves;
-    this.banner = { text: last ? 'Final Wave!' : `Wave ${this.wave}`, sub: boss ? 'A boss leads this attack' : null, t: 0 };
+    this.banner = { text: this.wave === this.totalWaves ? 'Final Wave!' : `Wave ${this.wave}`, sub: boss ? 'A boss leads this attack' : null, t: 0 };
     audio.play('wave');
   }
 
   callWave() {
     if (this.phase === 'prep') { audio.play('click'); this.startWave(); return; }
     if (this.phase === 'inter') {
-      const bonus = Math.ceil(this.interT) * 2;
-      if (bonus > 0) { this.gold += bonus; this.addText(view.W / 2, this.fieldTop + 120, `+${bonus} gold`, '#ffd34d', 28); }
+      const bonus = Math.ceil(this.interT / 2);
+      if (bonus > 0) { this.coins += bonus; this.addText(view.W / 2, this.fieldTop + 130, `+${bonus} coins`, '#ffd34d', 26); }
       audio.play('coin');
       this.startWave();
     }
   }
 
   waveCleared() {
-    const bonus = 20 + 5 * Math.min(this.wave, 12);
-    this.gold += bonus;
+    const bonus = 5 + 2 * Math.min(this.wave, 12);
+    this.coins += bonus;
     if (this.wave >= this.totalWaves) { this.endBattle(true); return; }
-    this.banner = { text: `Wave ${this.wave} cleared!`, sub: `+${bonus} gold`, t: 0 };
-    const boon = this.endless ? this.wave % this.stage.boonEvery === 0 : this.stage.boonAfter.includes(this.wave);
-    if (boon) this.openBoons();
-    else this.startIntermission();
-  }
-
-  startIntermission() { this.phase = 'inter'; this.interT = 12; }
-
-  openBoons() {
-    this.phase = 'boon';
-    this.aiming = -1;
-    this.selected = -1;
-    const heroIds = this.heroes.map((h) => h.def.id);
-    const pool = BOONS.filter((b) =>
-      !(b.id === 'frost' && this.mods.frost >= 0.5) &&
-      (!b.requires || this.stage.towers.includes(b.requires)) &&
-      (!b.hero || heroIds.includes(b.hero)));
-    this.boonChoices = shuffle(pool).slice(0, 3);
-    this.boonT = 0;
-    audio.play('boon');
-  }
-
-  chooseBoon(b) {
-    b.apply(this.mods, this);
-    this.boonsTaken.push(b);
-    this.boonChoices = null;
-    audio.play('build');
-    this.startIntermission();
+    this.banner = { text: `Wave ${this.wave} cleared!`, sub: `+${bonus} coins. Collect, build, upgrade!`, t: 0 };
+    this.phase = 'inter';
+    this.interT = 18;
   }
 
   endBattle(win) {
     this.phase = 'end';
-    this.aiming = -1;
-    this.selected = -1;
-    const frac = this.wallHp / this.wallMax;
+    this.joy = null;
+    const frac = this.keepHp / this.keepMax;
     const stars = win ? (frac >= 0.8 ? 3 : frac >= 0.45 ? 2 : 1) : 0;
     this.result = { win, stars, t: 0, frac, unlocks: [] };
     if (this.endless) {
@@ -192,12 +185,12 @@ export class Battle {
     this.time += dt;
     if (this.banner) { this.banner.t += dt; if (this.banner.t > (this.banner.long ? 3.6 : 2.4)) this.banner = null; }
     if (this.result) this.result.t += dt;
-    if (this.phase === 'boon') this.boonT += dt;
-    if (this.paused || this.phase === 'boon') return;
+    if (this.paused) return;
     for (let i = 0; i < this.speed; i++) this.step(dt);
   }
 
   step(dt) {
+    this.simTime += dt;
     if (this.phase === 'end') { this.updateFx(dt); return; }
     if (this.phase === 'wave') {
       this.waveTime += dt;
@@ -210,14 +203,199 @@ export class Battle {
       this.interT -= dt;
       if (this.interT <= 0) this.startWave();
     }
-    this.updateHeroes(dt);
+    this.updateKing(dt);
+    this.updateSpots(dt);
     this.updateTowers(dt);
     this.updateEnemies(dt);
     this.updateProjectiles(dt);
+    this.updateDrops(dt);
     this.updateEffects(dt);
     this.updateFx(dt);
   }
 
+  // ------------------------------------------------------------ the King
+  moveDir() {
+    if (this.autoMove) return this.autoMove;
+    let dx = 0, dy = 0, mag = 0;
+    if (this.joy) {
+      const vx = this.joy.x - this.joy.ox, vy = this.joy.y - this.joy.oy;
+      const len = Math.hypot(vx, vy);
+      if (len > 8) { dx = vx / len; dy = vy / len; mag = Math.min(1, len / 45); }
+    }
+    let kx = 0, ky = 0;
+    if (this.keys.has('left')) kx -= 1;
+    if (this.keys.has('right')) kx += 1;
+    if (this.keys.has('up')) ky -= 1;
+    if (this.keys.has('down')) ky += 1;
+    if (kx || ky) { const l = Math.hypot(kx, ky); dx = kx / l; dy = ky / l; mag = 1; }
+    return { x: dx * mag, y: dy * mag };
+  }
+
+  updateKing(dt) {
+    const k = this.king;
+    k.anim = Math.max(0, k.anim - dt * 5);
+    k.hurt = Math.max(0, k.hurt - dt * 4);
+    if (k.dead) {
+      k.respawnT -= dt;
+      if (k.respawnT <= 0) {
+        k.dead = false;
+        k.hp = k.maxHp;
+        k.x = 360; k.y = this.townTop - 50;
+        this.burst(k.x, k.y - 20, '#ffe36b', 16, 160);
+        audio.play('respawn');
+      }
+      return;
+    }
+    const dir = this.moveDir();
+    const mag = Math.hypot(dir.x, dir.y);
+    k.moving = mag > 0.05;
+    if (k.moving) {
+      k.x += dir.x * KING.speed * dt;
+      k.y += dir.y * KING.speed * dt;
+      k.walk += dt * 14;
+    }
+    k.x = clamp(k.x, 22, view.W - 22);
+    k.y = clamp(k.y, this.fieldTop + 24, this.townBottom - 18);
+    // can't walk through the Keep
+    const r = this.keepRect;
+    if (k.x > r.x - 12 && k.x < r.x + r.w + 12 && k.y > r.y + 20 && k.y < r.y + r.h + 10) {
+      const outs = [
+        [k.y - (r.y + 20), 0, -1], [r.y + r.h + 10 - k.y, 0, 1],
+        [k.x - (r.x - 12), -1, 0], [r.x + r.w + 12 - k.x, 1, 0],
+      ].sort((a, b) => a[0] - b[0]);
+      k.x += outs[0][1] * outs[0][0];
+      k.y += outs[0][2] * outs[0][0];
+    }
+    if (this.simTime - k.lastHurt > KING.regenDelay) k.hp = Math.min(k.maxHp, k.hp + KING.regen * dt);
+
+    // shooting: nearest enemies first, one arrow each (more with Volley)
+    k.atk -= dt * (1 + ARMORY.quiver.per * this.up.quiver);
+    if (k.atk > 0) return;
+    const ox = k.x, oy = k.y - 22;
+    const r2 = KING.range * KING.range;
+    const near = this.enemies.filter((e) => !e.dead && dist2(ox, oy, e.x, aimY(e)) <= r2)
+      .sort((a, b) => dist2(ox, oy, a.x, aimY(a)) - dist2(ox, oy, b.x, aimY(b)));
+    if (!near.length) { k.atk = 0; return; }
+    k.atk = 1 / KING.rate;
+    k.anim = 1;
+    const dmg = KING.dmg * (1 + ARMORY.bow.per * this.up.bow);
+    const shots = 1 + this.up.volley;
+    for (let i = 0; i < shots; i++) {
+      const tg = near[i % near.length];
+      if (i === 0) k.aim = Math.atan2(aimY(tg) - oy, tg.x - ox);
+      this.fire({ kind: 'arrow', x: ox + Math.cos(k.aim) * 14, y: oy + Math.sin(k.aim) * 14, target: tg, speed: KING.arrowSpeed, dmg: i ? dmg * ARMORY.volley.extraDmg : dmg, royal: true });
+    }
+    audio.play('bow');
+  }
+
+  hitKing(dmg) {
+    const k = this.king;
+    if (k.dead || this.phase === 'end') return;
+    k.hp -= dmg;
+    k.hurt = 1;
+    k.lastHurt = this.simTime;
+    audio.play('hurt');
+    if (k.hp <= 0) {
+      k.hp = 0;
+      k.dead = true;
+      k.respawnT = KING.respawn;
+      this.joy = null;
+      // drop a quarter of carried coins where he fell: go back and grab them!
+      const lost = Math.floor(this.coins * 0.25);
+      if (lost > 0) { this.coins -= lost; this.dropCoins(k.x, k.y, lost); }
+      this.burst(k.x, k.y - 20, '#b8262e', 20, 200);
+      this.banner = { text: 'The King has fallen!', sub: `Back in ${KING.respawn} seconds${lost ? `. Dropped ${lost} coins` : ''}`, t: 0 };
+      audio.play('lose');
+    }
+  }
+
+  // ------------------------------------------------------------ building
+  spotCost(sp) {
+    if (sp.kind === 'tower') return TOWER.levels[sp.level]?.cost ?? null;
+    if (sp.kind === 'wall') {
+      if (sp.level >= BARRICADE.levels.length) return sp.hp < sp.maxHp ? 15 : null;
+      return BARRICADE.levels[sp.level].cost;
+    }
+    if (sp.kind === 'repair') return this.keepHp < this.keepMax ? ARMORY.repair.cost : null;
+    return ARMORY[sp.kind].costs[this.up[sp.kind]] ?? null;
+  }
+
+  spotLevel(sp) { return ARMORY[sp.kind] && sp.kind !== 'repair' ? this.up[sp.kind] : sp.level; }
+
+  spotAt(x, y) {
+    let best = null, bd = 36 * 36;
+    for (const sp of this.spots) {
+      const d = dist2(x, y, sp.x, sp.y);
+      if (d < bd) { bd = d; best = sp; }
+    }
+    return best;
+  }
+
+  updateSpots(dt) {
+    const k = this.king;
+    const sp = k.dead ? null : this.spotAt(k.x, k.y);
+    if (sp !== this.onSpot) { if (this.onSpot) this.onSpot.dwell = 0; this.onSpot = sp; }
+    if (!sp) return;
+    sp.dwell += dt;
+    const cost = this.spotCost(sp);
+    if (cost === null || sp.dwell < PAY_DELAY || this.coins <= 0) return;
+    // bigger purchases pay faster so nothing takes more than ~1.5s
+    sp.acc += Math.max(PAY_RATE, cost / 1.5) * dt;
+    let paidNow = 0;
+    while (sp.acc >= 1 && this.coins > 0 && sp.paid < cost) {
+      sp.acc -= 1; sp.paid++; this.coins--; paidNow++;
+    }
+    if (paidNow) {
+      audio.play('pay');
+      if (Math.random() < 0.6) this.particle({ kind: 'coinfly', x: k.x, y: k.y - 30, vx: (sp.x - k.x) * 3, vy: (sp.y - 30 - k.y) * 3 - 120, g: 500, life: 0.35, size: 6, color: '#ffd24a' });
+    }
+    if (sp.paid >= cost) this.completeSpot(sp);
+  }
+
+  completeSpot(sp) {
+    sp.paid = 0;
+    sp.acc = 0;
+    sp.dwell = -0.5; // short pause before the next level starts filling
+    let msg;
+    if (sp.kind === 'tower') {
+      sp.level++;
+      msg = sp.level === 1 ? 'Watch Tower built!' : `Tower level ${sp.level}!`;
+      this.burst(sp.x, sp.y - 40, '#ffd23f', 16, 180);
+    } else if (sp.kind === 'wall') {
+      if (sp.level < BARRICADE.levels.length) { sp.level++; msg = sp.level === 1 ? 'Barricade up!' : `Barricade level ${sp.level}!`; }
+      else msg = 'Barricade repaired!';
+      sp.maxHp = BARRICADE.levels[sp.level - 1].hp;
+      sp.hp = sp.maxHp;
+      this.burst(sp.x, sp.y - 20, '#cbb994', 16, 160);
+    } else if (sp.kind === 'repair') {
+      this.keepHp = Math.min(this.keepMax, this.keepHp + ARMORY.repair.amount);
+      msg = `Keep +${ARMORY.repair.amount}`;
+      this.burst(360, this.townTop + 60, '#8fe07a', 16, 160);
+    } else {
+      this.up[sp.kind]++;
+      msg = `${ARMORY[sp.kind].name} ${this.up[sp.kind]}: ${ARMORY[sp.kind].desc}`;
+      this.burst(sp.x, sp.y - 20, '#ffd23f', 16, 180);
+    }
+    this.addText(sp.x, sp.y - 70, msg, '#ffe9a8', 22);
+    audio.play('build');
+  }
+
+  damageWall(sp, dmg) {
+    if (sp.level <= 0) return;
+    sp.hp -= dmg;
+    sp.hit = 1;
+    audio.play('wall');
+    for (let i = 0; i < 2; i++) this.particle({ x: sp.x + rand(-20, 20), y: sp.y - 15, vx: rand(-60, 60), vy: rand(-140, -60), g: 500, life: 0.4, size: 4, color: '#8a5a32' });
+    if (sp.hp <= 0) {
+      sp.level = 0; sp.hp = 0; sp.maxHp = 0; sp.paid = 0;
+      this.burst(sp.x, sp.y - 15, '#8a5a32', 22, 220);
+      this.addText(sp.x, sp.y - 50, 'Barricade broken!', '#ff9a7a', 22);
+      this.shake = Math.max(this.shake, 6);
+      audio.play('smash');
+    }
+  }
+
+  // ------------------------------------------------------------ enemies
   spawn(type, pathIdx, opt = {}) {
     const d = ENEMIES[type];
     const hpMul = (this.stage.hpMul || 1) * (1 + this.stage.hpGrowth * (this.wave - 1));
@@ -226,17 +404,17 @@ export class Battle {
     const P = this.paths[path];
     const maxHp = Math.round(d.hp * hpMul);
     const e = {
-      ...d, type, maxHp, hp: maxHp, path, d: opt.d || 0, x: 0, y: 0, alt: 0,
+      ...d, type, maxHp, hp: maxHp, path, d: opt.d || 0, x: 0, y: 0, alt: 0, tgt: null,
       state: 'walk', phase: Math.random() * TAU, jit: rand(-1, 1) * (d.boss ? 30 : 85), lane: d.boss ? 0 : rand(-13, 13),
-      slowT: 0, slowF: 0, stunT: 0, hasteT: 0, burnT: 0, burnDps: 0, flash: 0, swing: 0, atkT: 0.4,
+      slowT: 0, slowF: 0, stunT: 0, hasteT: 0, flash: 0, swing: 0, atkT: 0.4,
       cryT: 5, healT: d.healEvery || 0, sumT: d.summon ? d.summon.every * 0.6 : 0, dead: false,
     };
     if (d.flying) {
       const s = P.at(0);
       e.fx0 = s.x + rand(-30, 30);
       e.fy0 = s.y;
-      e.fx1 = rand(110, 610);
-      e.fy1 = this.wallY - d.r - 34;
+      e.fx1 = rand(290, 430);
+      e.fy1 = this.townTop + 6;
       e.dEnd = Math.hypot(e.fx1 - e.fx0, e.fy1 - e.fy0);
       e.alt = 30;
     } else {
@@ -244,19 +422,12 @@ export class Battle {
     }
     this.placeEnemy(e);
     this.enemies.push(e);
-
     if (!this.seen.has(type)) {
       this.seen.add(type);
-      if (this.stage.intro?.includes(type)) {
-        this.banner = { text: d.boss ? d.name : `New foe: ${d.name}`, sub: d.tip, t: 0, long: true };
-      } else if (d.boss) {
-        this.banner = { text: d.name, sub: 'Boss incoming!', t: 0 };
-      }
+      if (this.stage.intro?.includes(type)) this.banner = { text: d.boss ? d.name : `New foe: ${d.name}`, sub: d.tip, t: 0, long: true };
+      else if (d.boss) this.banner = { text: d.name, sub: 'Boss incoming!', t: 0 };
     }
-    if (d.boss && !opt.summoned) {
-      audio.play('roar');
-      this.shake = Math.max(this.shake, 8);
-    }
+    if (d.boss && !opt.summoned) { audio.play('roar'); this.shake = Math.max(this.shake, 8); }
     return e;
   }
 
@@ -270,7 +441,6 @@ export class Battle {
     const P = this.paths[e.path];
     const p = P.at(e.d);
     const t = e.ranged ? 0 : smooth((e.d - (P.length - 170)) / 150);
-    // sideways "lane" offset so crowds don't walk in a perfect single file
     e.x = p.x - p.dy * e.lane * (1 - t) + e.jit * t;
     e.y = p.y + p.dx * e.lane * (1 - t);
   }
@@ -280,160 +450,97 @@ export class Battle {
     return e.d / (len || 1) + (e.state === 'attack' ? 1 : 0);
   }
 
-  // Most advanced enemy in range. ground: skip flyers.
-  findTarget(x, y, range, ground = false) {
+  // Standing barricade ahead of this enemy on its road: { spot, d, stopD }.
+  blockerFor(e) {
+    if (e.flying) return null;
+    let best = null;
+    for (const sp of this.spots) {
+      if (sp.kind !== 'wall' || sp.level <= 0) continue;
+      for (const b of sp.blocks) {
+        if (b.path !== e.path || b.d < e.d - 2) continue;
+        const stopD = Math.max(0, b.d - (e.ranged ? 150 : e.r + 12));
+        if (!best || b.d < best.d) best = { spot: sp, d: b.d, stopD };
+      }
+    }
+    return best;
+  }
+
+  // Most advanced enemy in range (towers use this).
+  findTarget(x, y, range) {
     const r2 = range * range;
     let best = null, bp = -1;
     for (const e of this.enemies) {
-      if (e.dead || (ground && e.flying) || dist2(x, y, e.x, e.y) > r2) continue;
+      if (e.dead || dist2(x, y, e.x, aimY(e)) > r2) continue;
       const prog = this.progress(e);
       if (prog > bp) { bp = prog; best = e; }
     }
     return best;
   }
 
-  applySlow(e, f, t) {
-    if (e.boss) f *= 0.5;
-    e.slowF = e.slowT > 0 ? Math.max(e.slowF, f) : f;
-    e.slowT = Math.max(e.slowT, t);
-  }
-
-  updateHeroes(dt) {
-    const m = this.mods;
-    for (const h of this.heroes) {
-      h.cd = Math.max(0, h.cd - dt);
-      h.anim = Math.max(0, h.anim - dt * 4);
-      h.atk -= dt * m.heroRate;
-      if (h.atk > 0) continue;
-      const d = h.def;
-      const tg = this.findTarget(h.x, h.y - 40, d.range * m.range);
-      if (!tg) { h.atk = 0; continue; }
-      h.atk = 1 / d.rate;
-      h.anim = 1;
-      h.angle = Math.atan2(aimY(tg) - (h.y - 40), tg.x - h.x);
-      if (d.proj === 'bolt') {
-        this.chainZap(h.x + 18, h.y - 62, tg, d.dmg, d.chain + m.chain, d.chainRange, d.chainFalloff);
-        audio.play('zap');
-        continue;
-      }
-      this.fire({
-        kind: d.proj, x: h.x, y: h.y - 46, target: tg, speed: d.projSpeed, dmg: d.dmg, dtype: d.dtype,
-        splash: d.splash || 0, slow: d.id === 'wren' ? m.frost : 0,
-      });
-      audio.play(d.proj === 'fireball' ? 'fire' : d.proj === 'axe' ? 'axe' : 'bow');
-    }
-  }
-
-  chainZap(x0, y0, first, dmg, jumps, range, falloff) {
-    const pts = [[x0, y0]];
-    const hit = new Set();
-    let cur = first;
-    let d = dmg;
-    for (let k = 0; k <= jumps && cur; k++) {
-      hit.add(cur);
-      pts.push([cur.x, aimY(cur)]);
-      this.damage(cur, d, 'magic');
-      d *= falloff;
-      let next = null, bd = range * range;
-      for (const e of this.enemies) {
-        if (e.dead || hit.has(e)) continue;
-        const dd = dist2(cur.x, cur.y, e.x, e.y);
-        if (dd < bd) { bd = dd; next = e; }
-      }
-      cur = next;
-    }
-    this.effects.push({ kind: 'lightning', pts, t: 0, dur: 0.16 });
-  }
-
-  updateTowers(dt) {
-    const m = this.mods;
-    for (const t of this.towers) {
-      const def = TOWERS[t.type];
-      const L = def.levels[t.level - 1];
-      t.anim = Math.max(0, t.anim - dt * 4);
-      t.atk -= dt * m.towerRate;
-      if (t.atk > 0) continue;
-      const range = this.towerRange(t);
-      const tg = this.findTarget(t.x, t.y, range, !def.air);
-      if (!tg) { t.atk = 0; continue; }
-      t.atk = 1 / L.rate;
-      t.anim = 1;
-      t.angle = Math.atan2(tg.y - (t.y - 34), tg.x - t.x);
-      if (t.type === 'frost') {
-        const r2 = range * range;
-        for (const e of this.enemies) {
-          if (e.dead || dist2(t.x, t.y, e.x, e.y) > r2) continue;
-          this.damage(e, L.dmg, 'magic', { quiet: true });
-          if (!e.dead) this.applySlow(e, Math.min(0.75, L.slow + m.frostSlow), 1.6);
-        }
-        this.effects.push({ kind: 'ring', x: t.x, y: t.y, r: range, t: 0, dur: 0.45, color: '#bfefff', flat: true });
-        audio.play('frost');
-      } else if (t.type === 'arrow') {
-        this.fire({ kind: 'arrow', x: t.x, y: t.y - 70, target: tg, speed: def.projSpeed, dmg: L.dmg, dtype: 'phys', slow: m.frost });
-        audio.play('bow');
-      } else if (t.type === 'mage') {
-        this.fire({ kind: 'arcane', x: t.x, y: t.y - 116, target: tg, speed: def.projSpeed, dmg: L.dmg * m.mageDmg, dtype: 'magic' });
-        audio.play('arcane');
-      } else {
-        this.fire({
-          kind: 'ball', x: t.x + Math.cos(t.angle) * 30, y: t.y - 34 + Math.sin(t.angle) * 30, target: tg,
-          speed: def.projSpeed, dmg: L.dmg * m.cannonDmg, dtype: 'phys', splash: L.splash * m.cannonSplash, ground: true,
-        });
-        this.burst(t.x + Math.cos(t.angle) * 36, t.y - 34 + Math.sin(t.angle) * 36, '#d8d0c4', 5, 60, 0);
-        audio.play('cannon');
-      }
-    }
-  }
-
-  towerRange(t) {
-    const L = TOWERS[t.type].levels[t.level - 1];
-    return L.range * this.mods.range * (t.type === 'frost' ? this.mods.frostRange : 1);
-  }
-
   updateEnemies(dt) {
-    const m = this.mods;
-    // iterate a snapshot: summons add enemies mid-loop
+    const k = this.king;
     for (const e of this.enemies.slice()) {
       if (e.dead) continue;
       e.flash = Math.max(0, e.flash - dt * 6);
       e.swing = Math.max(0, e.swing - dt * 4);
       if (e.slowT > 0) e.slowT -= dt;
       if (e.hasteT > 0) e.hasteT -= dt;
-      if (e.burnT > 0) {
-        e.burnT -= dt;
-        this.damage(e, e.burnDps * dt, 'magic', { quiet: true, noCrit: true });
-        if (Math.random() < dt * 10) {
-          this.particle({ x: e.x + rand(-e.r, e.r) * 0.6, y: aimY(e) + rand(-e.r, e.r) * 0.5, vy: -50, life: 0.5, size: rand(3, 5), color: Math.random() < 0.5 ? '#ff9a2e' : '#ffd25a' });
-        }
-        if (e.dead) continue;
-      }
       if (e.stunT > 0) { e.stunT -= dt; continue; }
       if (e.cry) this.warCry(e, dt);
       if (e.heal) this.shamanHeal(e, dt);
       if (e.summon) this.summon(e, dt);
       const haste = e.hasteT > 0 ? 1.35 : 1;
-      if (e.state === 'walk') {
-        const sp = e.speed * m.enemySpeed * (e.slowT > 0 ? 1 - e.slowF : 1) * haste;
-        e.d += sp * dt;
-        e.phase += dt * sp * 0.16;
-        if (e.d >= e.dEnd) { e.d = e.dEnd; e.state = 'attack'; e.atkT = 0.3; }
+
+      // pick what to fight: the King if he's close, else a barricade, else the Keep
+      let tgt = null;
+      if (!k.dead) {
+        const kd = dist2(e.x, e.y, k.x, k.y);
+        const reach = e.r + KING.r + 8;
+        if (kd < reach * reach) tgt = 'king';
+        else if (e.ranged && kd < 200 * 200) tgt = 'king';
+      }
+      let limit = e.dEnd;
+      if (!tgt) {
+        const blk = this.blockerFor(e);
+        if (blk && blk.stopD < limit) limit = blk.stopD;
+        if (e.d >= limit - 0.5) tgt = blk && blk.stopD <= e.dEnd ? blk.spot : 'keep';
+      }
+      if (!tgt) {
+        e.state = 'walk';
+        e.tgt = null;
+        const spd = e.speed * (e.slowT > 0 ? 1 - e.slowF : 1) * haste;
+        e.d = Math.min(limit, e.d + spd * dt);
+        e.phase += dt * spd * 0.16;
         this.placeEnemy(e);
+        e.atkT = Math.min(e.atkT, 0.5);
+        continue;
+      }
+      e.state = 'attack';
+      e.tgt = tgt;
+      e.atkT -= dt * haste;
+      if (e.atkT > 0) continue;
+      e.atkT = e.hitEvery;
+      e.swing = 1;
+      if (tgt === 'king') {
+        if (e.ranged) this.enemyShot(e, k.x, k.y - 18, 'king');
+        else this.hitKing(e.hit * KING.kingHit);
+      } else if (tgt === 'keep') {
+        if (e.ranged) this.enemyShot(e, e.x + rand(-30, 30), this.townTop + 30, 'keep');
+        else this.hitKeep(e.hit, e.x);
       } else {
-        e.atkT -= dt * haste;
-        if (e.atkT <= 0) {
-          e.atkT = e.hitEvery;
-          e.swing = 1;
-          if (e.ranged) {
-            const tx = e.x + rand(-30, 30), ty = this.wallY - 2;
-            this.projectiles.push({ kind: 'ebolt', x: e.x, y: e.y - e.r, tx, ty, speed: 620, dmg: e.hit, enemyShot: true, angle: Math.atan2(ty - e.y, tx - e.x), prog: 0, spin: 0, total: 1 });
-            audio.play('ebolt');
-          } else {
-            this.hitWall(e.hit, e.x);
-          }
-        }
+        if (e.ranged) this.enemyShot(e, tgt.x + rand(-15, 15), tgt.y - 18, 'wall', tgt);
+        else this.damageWall(tgt, e.hit);
       }
     }
     this.enemies = this.enemies.filter((e) => !e.dead);
+  }
+
+  enemyShot(e, tx, ty, kind, spot) {
+    this.projectiles.push({
+      kind: 'ebolt', x: e.x, y: e.y - e.r, tx, ty, speed: kind === 'king' ? 430 : 600, dmg: e.hit,
+      hitKind: kind, spot, angle: Math.atan2(ty - e.y, tx - e.x),
+    });
+    audio.play('ebolt');
   }
 
   warCry(e, dt) {
@@ -456,7 +563,7 @@ export class Battle {
       if (o === e || o.dead || o.hp >= o.maxHp || dist2(o.x, o.y, e.x, e.y) > r2) continue;
       o.hp = Math.min(o.maxHp, o.hp + o.maxHp * e.heal);
       any = true;
-      for (let k = 0; k < 3; k++) this.particle({ x: o.x + rand(-10, 10), y: aimY(o) + rand(-6, 6), vy: -60, life: 0.6, size: 4, color: '#7dff9a' });
+      for (let i = 0; i < 3; i++) this.particle({ x: o.x + rand(-10, 10), y: aimY(o) + rand(-6, 6), vy: -60, life: 0.6, size: 4, color: '#7dff9a' });
     }
     if (any) {
       this.effects.push({ kind: 'ring', x: e.x, y: e.y, r: e.healRange, t: 0, dur: 0.6, color: '#7dff9a', flat: true });
@@ -468,39 +575,48 @@ export class Battle {
     e.sumT -= dt;
     if (e.sumT > 0 || e.state !== 'walk') return;
     e.sumT = e.summon.every;
-    for (let k = 0; k < e.summon.n; k++) {
-      const s = this.spawn(e.summon.type, e.path, { d: Math.max(0, e.d - 30 - k * 20), summoned: true });
+    for (let i = 0; i < e.summon.n; i++) {
+      const s = this.spawn(e.summon.type, e.path, { d: Math.max(0, e.d - 30 - i * 20), summoned: true });
       this.burst(s.x, s.y - 10, '#7dff6a', 8, 120);
     }
     this.effects.push({ kind: 'ring', x: e.x, y: e.y - e.r * 0.5, r: 90, t: 0, dur: 0.5, color: '#8aff7a' });
     audio.play('summon');
   }
 
-  hitWall(dmg, x) {
+  hitKeep(dmg, x) {
     if (this.phase === 'end') return;
-    this.wallHp = Math.max(0, this.wallHp - dmg);
-    this.wallFlash = 1;
+    this.keepHp = Math.max(0, this.keepHp - dmg);
+    this.keepFlash = 1;
     audio.play('wall');
     for (let i = 0; i < 3; i++) {
-      this.particle({ x: x + rand(-14, 14), y: this.wallY - 8, vx: rand(-60, 60), vy: rand(-120, -40), g: 400, life: 0.45, size: rand(3, 5), color: '#b3a998' });
+      this.particle({ x: x + rand(-14, 14), y: this.townTop + 10, vx: rand(-60, 60), vy: rand(-120, -40), g: 400, life: 0.45, size: rand(3, 5), color: '#b3a998' });
     }
     if (dmg >= 25) this.shake = Math.max(this.shake, dmg >= 60 ? 10 : 4);
-    if (this.wallHp <= 0) this.endBattle(false);
+    if (this.keepHp <= 0) this.endBattle(false);
   }
 
-  healWall(frac) {
-    const amt = Math.round(this.wallMax * frac);
-    this.wallHp = Math.min(this.wallMax, this.wallHp + amt);
-    this.addText(view.W / 2, this.wallY - 40, `+${amt} wall`, '#8fe07a', 28);
+  // ------------------------------------------------------------ towers
+  updateTowers(dt) {
+    for (const t of this.spots) {
+      if (t.kind !== 'tower' || t.level <= 0) continue;
+      const L = TOWER.levels[t.level - 1];
+      t.anim = Math.max(0, t.anim - dt * 4);
+      t.atk -= dt;
+      if (t.atk > 0) continue;
+      const tg = this.findTarget(t.x, t.y - 40, L.range);
+      if (!tg) { t.atk = 0; continue; }
+      t.atk = 1 / L.rate;
+      t.anim = 1;
+      this.fire({ kind: 'arrow', x: t.x, y: t.y - 70, target: tg, speed: 900, dmg: L.dmg });
+      audio.play('bow');
+    }
   }
 
+  // ------------------------------------------------------------ projectiles
   fire(p) {
     p.tx = p.target.x;
     p.ty = aimY(p.target);
-    p.total = Math.max(1, Math.hypot(p.tx - p.x, p.ty - p.y));
     p.angle = Math.atan2(p.ty - p.y, p.tx - p.x);
-    p.prog = 0;
-    p.spin = 0;
     this.projectiles.push(p);
   }
 
@@ -510,7 +626,6 @@ export class Battle {
       const dx = p.tx - p.x, dy = p.ty - p.y;
       const d = Math.hypot(dx, dy);
       const step = p.speed * dt;
-      p.spin += dt * 18;
       if (d <= step) {
         p.x = p.tx; p.y = p.ty;
         this.impact(p);
@@ -520,184 +635,95 @@ export class Battle {
       p.x += (dx / d) * step;
       p.y += (dy / d) * step;
       p.angle = Math.atan2(dy, dx);
-      p.prog = clamp(1 - d / p.total, 0, 1);
-      if ((p.kind === 'fireball' || p.kind === 'arcane') && Math.random() < 0.7) {
-        const c = p.kind === 'fireball' ? ['#ff8a2a', '#ffd25a'] : ['#d07aff', '#f4c8ff'];
-        this.particle({ x: p.x + rand(-4, 4), y: p.y + rand(-4, 4), life: 0.3, size: rand(3, 6), color: c[Math.random() < 0.5 ? 0 : 1] });
-      }
     }
     this.projectiles = this.projectiles.filter((p) => !p.done);
   }
 
   impact(p) {
-    if (p.enemyShot) { this.hitWall(p.dmg, p.tx); return; }
-    if (p.splash) {
-      const r2 = p.splash * p.splash;
-      for (const e of this.enemies) {
-        if (e.dead || (p.ground && e.flying) || dist2(p.tx, p.ty, e.x, aimY(e)) > r2) continue;
-        this.damage(e, p.dmg, p.dtype);
-        if (p.dtype === 'magic') this.applyBurn(e);
-      }
-      const fiery = p.kind === 'fireball';
-      this.burst(p.tx, p.ty, fiery ? '#ff8a2a' : '#5a5048', 10, 150, 0);
-      this.burst(p.tx, p.ty, fiery ? '#ffd25a' : '#d8cfc0', 6, 100, 0);
-      this.effects.push({ kind: 'ring', x: p.tx, y: p.ty, r: p.splash, t: 0, dur: 0.3, color: fiery ? '#ffb347' : '#e8e0d0' });
-      audio.play('hit');
-    } else if (p.target && !p.target.dead) {
-      const e = p.target;
-      this.damage(e, p.dmg, p.dtype);
-      if (p.dtype === 'magic') this.applyBurn(e);
-      if (p.slow > 0 && !e.dead) this.applySlow(e, p.slow, 1.5);
-      const c = p.kind === 'arcane' ? '#e9b0ff' : p.slow > 0 ? '#bfe9ff' : '#fff2c8';
-      this.burst(p.tx, p.ty, c, p.kind === 'arcane' ? 7 : 3, 80, 0);
+    if (p.kind === 'ebolt') {
+      if (p.hitKind === 'king') {
+        const k = this.king;
+        // bolts fly to where the King WAS: keep moving and they miss
+        if (!k.dead && dist2(k.x, k.y - 18, p.tx, p.ty) < 26 * 26) this.hitKing(p.dmg * KING.kingHit);
+        else this.burst(p.tx, p.ty, '#b8a48a', 3, 60);
+      } else if (p.hitKind === 'keep') this.hitKeep(p.dmg, p.tx);
+      else if (p.spot && p.spot.level > 0) this.damageWall(p.spot, p.dmg);
+      return;
+    }
+    if (p.target && !p.target.dead) {
+      this.damage(p.target, p.dmg);
+      this.burst(p.tx, p.ty, p.royal ? '#ffe9a8' : '#fff2c8', 3, 70, 0);
       audio.play('hit');
     }
   }
 
-  applyBurn(e) {
-    if (this.mods.burn > 0 && !e.dead) { e.burnT = 3; e.burnDps = Math.max(e.burnDps, this.mods.burn); }
-  }
-
-  damage(e, amt, dtype, opt = {}) {
+  damage(e, amt) {
     if (e.dead) return;
-    let a = amt * (dtype === 'phys' ? this.mods.phys : this.mods.magic);
-    let crit = false;
-    if (!opt.noCrit && this.mods.crit > 0 && Math.random() < this.mods.crit) { a *= 2; crit = true; }
-    if (dtype === 'phys') a *= 1 - e.armor;
-    e.hp -= a;
-    if (!opt.quiet) e.flash = 1;
-    if (crit) this.addText(e.x, aimY(e) - e.r * 1.6, `${Math.round(a)}!`, '#ffe066', 24);
+    e.hp -= amt * (1 - e.armor);
+    e.flash = 1;
     if (e.hp <= 0) this.kill(e);
   }
 
   kill(e) {
     e.dead = true;
     this.kills++;
-    const g = Math.max(1, Math.round(e.bounty * this.mods.gold));
-    this.gold += g;
-    this.addText(e.x, aimY(e) - e.r, `+${g}`, '#ffd34d', e.boss ? 40 : 22);
+    this.dropCoins(e.x, e.y, e.coins);
     this.burst(e.x, aimY(e), e.color, e.boss ? 40 : 10, e.boss ? 260 : 140);
     this.burst(e.x, aimY(e), '#f4efe6', e.boss ? 20 : 5, 90, 0);
     audio.play('coin');
     if (e.boss) { this.shake = 16; audio.play('boom'); }
   }
 
-  // ------------------------------------------------------------ skills
-  tapHero(i) {
-    if (this.phase === 'end') return;
-    const h = this.heroes[i];
-    if (h.cd > 0) { audio.play('error'); return; }
-    if (!h.def.skill.aim) { this.castSkill(i, h.x, h.y); return; }
-    this.selected = -1;
-    if (this.aiming === i) { this.aiming = -1; audio.play('click'); return; }
-    this.aiming = i;
-    const tg = this.findTarget(view.W / 2, this.wallY, 5000);
-    this.aimX = tg ? tg.x : view.W / 2;
-    this.aimY = tg ? tg.y : this.fieldTop + (this.wallY - this.fieldTop) * 0.6;
-    audio.play('click');
-  }
-
-  castSkill(i, x, y) {
-    const h = this.heroes[i];
-    const sk = h.def.skill;
-    if (h.cd > 0) return;
-    h.cd = sk.cd * this.mods.cd;
-    h.anim = 1;
-    this.aiming = -1;
-    audio.play('skill');
-    if (sk.id === 'storm') {
-      this.effects.push({ kind: 'storm', x, y, r: sk.radius, t: 0, dur: 1.6, next: 0, pulses: 0, total: sk.pulses, dmg: sk.dmg });
-    } else if (sk.id === 'meteor') {
-      this.effects.push({ kind: 'meteor', x, y, r: sk.radius, t: 0, delay: 0.75, hit: false, dmg: sk.dmg, burn: sk.burn });
-    } else if (sk.id === 'shout') {
-      const reach = this.wallY - sk.radius;
-      for (const e of this.enemies) if (!e.dead && e.y >= reach) e.stunT = Math.max(e.stunT, e.boss ? 1.2 : 2.5);
-      this.healWall(0.12);
-      this.effects.push({ kind: 'shout', x: h.x, y: this.wallY, r: sk.radius, t: 0, dur: 0.8 });
-      audio.play('shout');
-      this.shake = Math.max(this.shake, 6);
-    } else if (sk.id === 'thunder') {
-      this.effects.push({ kind: 'thunder', t: 0, dur: sk.dur, next: 0, left: sk.strikes, every: sk.dur / sk.strikes, dmg: sk.dmg, stun: sk.stun });
-      this.flash = 0.6;
+  // ------------------------------------------------------------ coins
+  dropCoins(x, y, total) {
+    const piece = total >= 40 ? 10 : 5;
+    while (total > 0) {
+      const v = Math.min(piece, total);
+      total -= v;
+      const a = rand(0, TAU), s = rand(20, 70);
+      this.drops.push({
+        x: clamp(x, 20, view.W - 20), y: clamp(y, this.fieldTop + 10, this.townBottom - 10),
+        vx: Math.cos(a) * s, vy: Math.sin(a) * s * 0.6, z: 0, vz: rand(140, 220),
+        value: v, life: COIN_LIFE, phase: rand(0, TAU), pull: false,
+      });
     }
   }
 
-  thunderStrike(f) {
-    const alive = this.enemies.filter((e) => !e.dead);
-    let x, y, tg = null;
-    if (alive.length) {
-      // favour enemies that haven't been struck yet
-      const fresh = alive.filter((e) => !f.struck?.has(e));
-      const pool = fresh.length ? fresh : alive;
-      tg = pool[Math.floor(Math.random() * pool.length)];
-      (f.struck ??= new Set()).add(tg);
-      x = tg.x; y = aimY(tg);
-    } else {
-      x = rand(60, view.W - 60);
-      y = rand(this.fieldTop + 60, this.wallY - 60);
-    }
-    if (tg) {
-      this.damage(tg, f.dmg, 'magic');
-      if (!tg.dead) tg.stunT = Math.max(tg.stunT, f.stun);
-      for (const e of this.enemies) {
-        if (e !== tg && !e.dead && dist2(x, y, e.x, aimY(e)) < 45 * 45) this.damage(e, f.dmg * 0.5, 'magic', { quiet: true });
+  updateDrops(dt) {
+    const k = this.king;
+    for (const c of this.drops) {
+      c.life -= dt;
+      if (c.z > 0 || c.vz > 0) {
+        c.vz -= 700 * dt;
+        c.z = Math.max(0, c.z + c.vz * dt);
+        c.x += c.vx * dt; c.y += c.vy * dt;
+        if (c.z === 0) c.vz = 0;
+      }
+      if (k.dead) continue;
+      const d2 = dist2(c.x, c.y, k.x, k.y);
+      if (c.pull || d2 < KING.magnet * KING.magnet) {
+        c.pull = true;
+        const d = Math.sqrt(d2) || 1;
+        const sp = Math.min(d, 650 * dt);
+        c.x += ((k.x - c.x) / d) * sp;
+        c.y += ((k.y - c.y) / d) * sp;
+        if (d < 18) {
+          c.taken = true;
+          this.coins += c.value;
+          this.addText(k.x + rand(-10, 10), k.y - 50, `+${c.value}`, '#ffd34d', 18);
+          audio.play('pickup');
+        }
       }
     }
-    this.effects.push({ kind: 'lightning', pts: [[x + rand(-40, 40), this.fieldTop - 20], [x, y]], t: 0, dur: 0.22 });
-    this.burst(x, y, '#bff6ff', 8, 160);
-    this.flash = Math.max(this.flash || 0, 0.25);
-    audio.play('thunder');
-  }
-
-  updateEffects(dt) {
-    for (const f of this.effects) {
-      f.t += dt;
-      if (f.kind === 'storm') {
-        for (let k = 0; k < 3; k++) {
-          const a = rand(0, TAU), rr = Math.sqrt(Math.random()) * f.r;
-          this.particle({ kind: 'arrow', x: f.x + Math.cos(a) * rr, y: f.y + Math.sin(a) * rr * 0.75 - 70, vy: 700, life: 0.1, color: '#3a2a1a' });
-        }
-        f.next -= dt;
-        if (f.next <= 0 && f.pulses < f.total) {
-          f.next = f.dur / f.total;
-          f.pulses++;
-          for (const e of this.enemies) {
-            if (e.dead || dist2(f.x, f.y, e.x, e.y) > f.r * f.r) continue;
-            this.damage(e, f.dmg, 'phys');
-            if (this.mods.frost > 0 && !e.dead) this.applySlow(e, this.mods.frost, 1.5);
-          }
-          audio.play('bow');
-        }
-        if (f.t >= f.dur) f.done = true;
-      } else if (f.kind === 'meteor') {
-        if (!f.hit && f.t >= f.delay) {
-          f.hit = true;
-          for (const e of this.enemies) {
-            if (e.dead || dist2(f.x, f.y, e.x, e.y) > f.r * f.r) continue;
-            this.damage(e, f.dmg, 'magic');
-            if (!e.dead) { e.burnT = 3; e.burnDps = f.burn + this.mods.burn; }
-          }
-          this.shake = Math.max(this.shake, 16);
-          audio.play('boom');
-          this.burst(f.x, f.y, '#ff7a2a', 30, 320);
-          this.burst(f.x, f.y, '#ffd25a', 24, 240);
-          this.burst(f.x, f.y, '#4a3a30', 16, 200);
-          this.effects.push({ kind: 'ring', x: f.x, y: f.y, r: f.r * 1.15, t: 0, dur: 0.5, color: '#ffb347' });
-          this.effects.push({ kind: 'scorch', x: f.x, y: f.y, r: f.r * 0.8, t: 0, dur: 4 });
-        }
-        if (f.t >= f.delay + 0.1) f.done = f.hit;
-      } else if (f.kind === 'thunder') {
-        f.next -= dt;
-        while (f.next <= 0 && f.left > 0) { f.next += f.every; f.left--; this.thunderStrike(f); }
-        if (f.left <= 0) f.done = true;
-      } else if (f.t >= f.dur) {
-        f.done = true;
-      }
-    }
-    this.effects = this.effects.filter((f) => !f.done);
+    this.drops = this.drops.filter((c) => !c.taken && c.life > 0);
   }
 
   // ------------------------------------------------------------ fx
+  updateEffects(dt) {
+    for (const f of this.effects) { f.t += dt; if (f.t >= f.dur) f.done = true; }
+    this.effects = this.effects.filter((f) => !f.done);
+  }
+
   particle(o) {
     const p = { vx: 0, vy: 0, g: 0, life: 0.5, size: 4, drag: 0, kind: 'dot', color: '#fff', ...o };
     p.max = p.life;
@@ -712,226 +738,143 @@ export class Battle {
   }
 
   addText(x, y, str, color, size = 24) {
-    this.texts.push({ x, y, str, color, size, life: 0.9, max: 0.9 });
+    this.texts.push({ x: clamp(x, 80, view.W - 80), y, str, color, size, life: 1.0, max: 1.0 });
   }
 
   updateFx(dt) {
     for (const p of this.particles) {
       p.life -= dt;
-      const k = 1 - p.drag * dt;
-      p.vx *= k;
-      p.vy = p.vy * k + p.g * dt;
+      const kk = 1 - p.drag * dt;
+      p.vx *= kk;
+      p.vy = p.vy * kk + p.g * dt;
       p.x += p.vx * dt;
       p.y += p.vy * dt;
     }
     this.particles = this.particles.filter((p) => p.life > 0);
     if (this.particles.length > 600) this.particles.splice(0, this.particles.length - 600);
-    for (const t of this.texts) { t.life -= dt; t.y -= 45 * dt; }
+    for (const t of this.texts) { t.life -= dt; t.y -= 40 * dt; }
     this.texts = this.texts.filter((t) => t.life > 0);
     this.shake = Math.max(0, this.shake - dt * 30);
-    this.wallFlash = Math.max(0, this.wallFlash - dt * 3);
-    this.flash = Math.max(0, (this.flash || 0) - dt * 3);
-  }
-
-  // ------------------------------------------------------------ towers
-  towerAt(pi) { return this.towers.find((t) => t.pad === pi); }
-
-  build(pi, type) {
-    const cost = TOWERS[type].levels[0].cost;
-    if (this.gold < cost) { audio.play('error'); return; }
-    this.gold -= cost;
-    const p = this.pads[pi];
-    this.towers.push({ pad: pi, type, level: 1, x: p.x, y: p.y, atk: 0.2, anim: 0, angle: -Math.PI / 2, spent: cost });
-    this.selected = -1;
-    this.burst(p.x, p.y, '#cbb994', 14, 160);
-    audio.play('build');
-  }
-
-  upgrade(t) {
-    const L = TOWERS[t.type].levels;
-    if (t.level >= L.length) return;
-    const cost = L[t.level].cost;
-    if (this.gold < cost) { audio.play('error'); return; }
-    this.gold -= cost;
-    t.spent += cost;
-    t.level++;
-    this.burst(t.x, t.y - 50, '#ffd23f', 16, 180);
-    audio.play('build');
-  }
-
-  sell(t) {
-    const refund = Math.floor(t.spent * 0.6);
-    this.gold += refund;
-    this.towers = this.towers.filter((x) => x !== t);
-    this.selected = -1;
-    this.addText(t.x, t.y - 60, `+${refund}`, '#ffd34d', 26);
-    this.burst(t.x, t.y, '#cbb994', 12, 140);
-    audio.play('sell');
+    this.keepFlash = Math.max(0, this.keepFlash - dt * 3);
+    for (const sp of this.spots) if (sp.hit) sp.hit = Math.max(0, sp.hit - dt * 5);
   }
 
   // ------------------------------------------------------------ input
   addHit(r, fn) { this.hits.push({ r, fn }); }
 
-  pointerDown(x, y) {
+  pointerDown(x, y, id = 0) {
     for (let i = this.hits.length - 1; i >= 0; i--) {
       const h = this.hits[i];
       if (inRect(x, y, h.r)) { h.fn(x, y); return; }
     }
-    this.fieldTap(x, y);
+    if (this.phase === 'end' || this.paused || this.king.dead) return;
+    this.joy = { id, ox: x, oy: y, x, y };
   }
 
-  pointerMove(x, y) {
-    if (this.aiming >= 0) { this.aimX = x; this.aimY = clamp(y, this.fieldTop, this.wallY - 10); }
+  pointerMove(x, y, id = 0) {
+    const j = this.joy;
+    if (!j || j.id !== id) return;
+    j.x = x; j.y = y;
+    // floating stick: drag the base along if the finger goes far
+    const vx = x - j.ox, vy = y - j.oy, len = Math.hypot(vx, vy);
+    if (len > 70) { j.ox = x - (vx / len) * 70; j.oy = y - (vy / len) * 70; }
   }
 
-  fieldTap(x, y) {
-    if (this.phase === 'end' || this.phase === 'boon' || this.paused) return;
-    if (this.aiming >= 0) {
-      if (y > this.fieldTop && y < this.wallY + 20) this.castSkill(this.aiming, x, Math.min(y, this.wallY - 10));
-      else this.aiming = -1;
-      return;
-    }
-    const pi = this.pads.findIndex((p) => Math.hypot(p.x - x, p.y - 25 - y) < 52);
-    if (pi >= 0) {
-      this.selected = this.selected === pi ? -1 : pi;
-      audio.play('click');
-    } else {
-      this.selected = -1;
-    }
-  }
+  pointerUp(id = 0) { if (this.joy && this.joy.id === id) this.joy = null; }
+
+  keyDown(k) { this.keys.add(k); }
+  keyUp(k) { this.keys.delete(k); }
 
   // ------------------------------------------------------------ render
   render(ctx) {
-    const { W, H } = view;
+    const { W } = view;
     const t = this.time;
+    const k = this.king;
     this.hits = [];
 
     ctx.save();
     if (this.shake > 0) ctx.translate(rand(-1, 1) * this.shake, rand(-1, 1) * this.shake);
-    ctx.drawImage(this.bg, 0, 0, W, H);
+    ctx.drawImage(this.bg, 0, 0, W, view.H);
 
-    const hint = this.towers.length === 0 && this.phase === 'prep' && Math.sin(t * 5) > 0;
-    this.pads.forEach((p, i) => { if (!this.towerAt(i)) drawPad(ctx, p.x, p.y, this.selected === i || hint); });
+    // town: Keep + armory
+    drawKeep(ctx, 360, this.townTop, t, this.keepFlash);
+    for (const sp of this.spots) {
+      if (!ARMORY[sp.kind]) continue;
+      const max = sp.kind === 'repair' ? 0 : ARMORY[sp.kind].costs.length;
+      drawArmorySpot(ctx, sp.kind, sp.x, sp.y, this.spotLevel(sp), max, this.onSpot === sp);
+      text(ctx, ARMORY[sp.kind].name, sp.x, sp.y + 40, { size: 15, color: '#fff3d6', lw: 4 });
+    }
 
-    // ground layer effects
+    // empty spots
+    for (const sp of this.spots) {
+      if (sp.level > 0) continue;
+      if (sp.kind === 'tower') drawPad(ctx, sp.x, sp.y, this.onSpot === sp);
+      else if (sp.kind === 'wall') drawBarricade(ctx, sp, t, true);
+    }
+    for (const c of this.drops) drawCoin(ctx, c, t);
+
     for (const f of this.effects) {
-      if (f.kind === 'scorch') {
-        ctx.globalAlpha = 0.35 * (1 - f.t / f.dur);
-        ctx.fillStyle = '#2a1a10';
-        ctx.beginPath(); ctx.ellipse(f.x, f.y, f.r, f.r * 0.7, 0, 0, TAU); ctx.fill();
-        ctx.globalAlpha = 1;
-      } else if (f.kind === 'storm') {
-        ctx.fillStyle = 'rgba(70,45,20,0.15)';
-        ctx.beginPath(); ctx.ellipse(f.x, f.y, f.r, f.r * 0.75, 0, 0, TAU); ctx.fill();
-        ctx.setLineDash([10, 8]);
-        ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,240,190,0.7)'; ctx.stroke();
-        ctx.setLineDash([]);
-      } else if (f.kind === 'meteor' && !f.hit) {
-        const k = f.t / f.delay;
-        ctx.fillStyle = `rgba(30,10,0,${0.15 + 0.3 * k})`;
-        ctx.beginPath(); ctx.ellipse(f.x, f.y, f.r * k, f.r * k * 0.7, 0, 0, TAU); ctx.fill();
-        ctx.lineWidth = 3; ctx.strokeStyle = `rgba(255,90,40,${0.5 + 0.5 * Math.sin(t * 20)})`;
-        ctx.beginPath(); ctx.ellipse(f.x, f.y, f.r, f.r * 0.7, 0, 0, TAU); ctx.stroke();
-      } else if (f.kind === 'ring' && f.flat) {
-        const k = f.t / f.dur;
-        ctx.globalAlpha = 0.5 * (1 - k);
-        ctx.fillStyle = f.color;
-        ctx.beginPath(); ctx.ellipse(f.x, f.y, f.r * (0.3 + 0.7 * k), f.r * (0.3 + 0.7 * k) * 0.8, 0, 0, TAU); ctx.fill();
-        ctx.globalAlpha = 1;
-      }
+      if (f.kind !== 'ring' || !f.flat) continue;
+      const kk = f.t / f.dur;
+      ctx.globalAlpha = 0.5 * (1 - kk);
+      ctx.fillStyle = f.color;
+      ctx.beginPath(); ctx.ellipse(f.x, f.y, f.r * (0.3 + 0.7 * kk), f.r * (0.3 + 0.7 * kk) * 0.8, 0, 0, TAU); ctx.fill();
+      ctx.globalAlpha = 1;
     }
 
-    // selected tower range
-    if (this.selected >= 0) {
-      const tw = this.towerAt(this.selected);
-      if (tw) {
-        ctx.fillStyle = 'rgba(255,255,255,0.10)';
-        ctx.beginPath(); ctx.arc(tw.x, tw.y, this.towerRange(tw), 0, TAU); ctx.fill();
-        ctx.setLineDash([12, 10]); ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.stroke(); ctx.setLineDash([]);
-      }
-    }
-
-    // depth-sorted towers + ground enemies; flyers on top
+    // depth-sorted world: towers, barricades, ground enemies, the King
     const list = [];
-    for (const tw of this.towers) list.push({ y: tw.y, tw });
-    for (const e of this.enemies) list.push({ y: e.y + (e.flying ? 10000 : 0), e });
-    list.sort((a, b) => a.y - b.y);
-    for (const d of list) {
-      if (d.tw) drawTower(ctx, d.tw, t);
-      else if (!d.e.flying) drawEnemy(ctx, d.e, t);
+    for (const sp of this.spots) {
+      if (sp.level <= 0) continue;
+      if (sp.kind === 'tower') list.push({ y: sp.y, draw: () => drawTower(ctx, sp, t) });
+      else if (sp.kind === 'wall') list.push({ y: sp.y, draw: () => this.drawWallSpot(ctx, sp) });
     }
+    for (const e of this.enemies) if (!e.flying) list.push({ y: e.y, draw: () => drawEnemy(ctx, e, t) });
+    if (!k.dead) list.push({ y: k.y, draw: () => drawKing(ctx, k, t) });
+    list.sort((a, b) => a.y - b.y);
+    for (const d of list) d.draw();
+    for (const e of this.enemies) if (e.flying) drawEnemy(ctx, e, t);
 
     for (const p of this.projectiles) this.drawProjectile(ctx, p);
 
-    // wall + heroes
-    drawWall(ctx, W, this.wallY, this.wallHp / this.wallMax, t);
-    if (this.wallFlash > 0) {
-      ctx.fillStyle = `rgba(255,50,30,${this.wallFlash * 0.22})`;
-      ctx.fillRect(0, this.wallY - 20, W, 104);
-    }
-    for (const h of this.heroes) {
-      if (this.aiming === h.i) {
-        ctx.fillStyle = 'rgba(255,230,120,0.35)';
-        ctx.beginPath(); ctx.ellipse(h.x, h.y, 30, 12, 0, 0, TAU); ctx.fill();
-      }
-      drawHero(ctx, h, t);
-    }
-    for (const d of list) if (d.e && d.e.flying) drawEnemy(ctx, d.e, t);
-
-    // particles
     for (const p of this.particles) {
       const a = clamp(p.life / p.max, 0, 1);
-      if (p.kind === 'arrow') {
-        ctx.strokeStyle = p.color; ctx.lineWidth = 2.5;
-        ctx.beginPath(); ctx.moveTo(p.x, p.y - 18); ctx.lineTo(p.x, p.y); ctx.stroke();
-        continue;
-      }
       ctx.globalAlpha = a;
-      ctx.fillStyle = p.color;
-      ctx.beginPath(); ctx.arc(p.x, p.y, p.size * (0.5 + 0.5 * a), 0, TAU); ctx.fill();
+      if (p.kind === 'coinfly') drawCoinIcon(ctx, p.x, p.y, 6);
+      else {
+        ctx.fillStyle = p.color;
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.size * (0.5 + 0.5 * a), 0, TAU); ctx.fill();
+      }
     }
     ctx.globalAlpha = 1;
 
-    // top-layer effects
     for (const f of this.effects) {
-      if (f.kind === 'ring' && !f.flat) {
-        const k = f.t / f.dur;
-        ctx.globalAlpha = 1 - k;
-        ctx.lineWidth = 6 * (1 - k) + 1; ctx.strokeStyle = f.color;
-        ctx.beginPath(); ctx.ellipse(f.x, f.y, f.r * (0.4 + 0.6 * k), f.r * (0.4 + 0.6 * k) * 0.75, 0, 0, TAU); ctx.stroke();
-        ctx.globalAlpha = 1;
-      } else if (f.kind === 'lightning') {
-        drawLightning(ctx, f.pts, 1 - f.t / f.dur);
-      } else if (f.kind === 'shout') {
-        const k = f.t / f.dur;
-        ctx.globalAlpha = 1 - k;
-        ctx.lineWidth = 10 * (1 - k) + 2; ctx.strokeStyle = '#9fd4ff';
-        ctx.beginPath(); ctx.ellipse(W / 2, f.y, W * 0.7 * k + 40, f.r * k, 0, Math.PI, TAU); ctx.stroke();
-        ctx.globalAlpha = 1;
-      } else if (f.kind === 'meteor' && !f.hit) {
-        const k = f.t / f.delay;
-        const mx = f.x + 260 * (1 - k), my = f.y - 520 * (1 - k);
-        const g = ctx.createRadialGradient(mx, my, 2, mx, my, 40);
-        g.addColorStop(0, '#fff6c0'); g.addColorStop(0.4, '#ffb347'); g.addColorStop(1, 'rgba(255,80,20,0)');
-        ctx.fillStyle = g;
-        ctx.beginPath(); ctx.arc(mx, my, 40, 0, TAU); ctx.fill();
-        ctx.fillStyle = '#5a2a14';
-        ctx.beginPath(); ctx.arc(mx, my, 16, 0, TAU); ctx.fill();
-        this.particle({ x: mx + rand(-8, 8), y: my + rand(-8, 8), life: 0.4, size: rand(4, 8), color: Math.random() < 0.5 ? '#ff8a2a' : '#ffd25a' });
-      }
+      if (f.kind !== 'ring' || f.flat) continue;
+      const kk = f.t / f.dur;
+      ctx.globalAlpha = 1 - kk;
+      ctx.lineWidth = 6 * (1 - kk) + 1; ctx.strokeStyle = f.color;
+      ctx.beginPath(); ctx.ellipse(f.x, f.y, f.r * (0.4 + 0.6 * kk), f.r * (0.4 + 0.6 * kk) * 0.75, 0, 0, TAU); ctx.stroke();
+      ctx.globalAlpha = 1;
     }
 
-    if (this.aiming >= 0) {
-      const r = this.heroes[this.aiming].def.skill.radius;
-      ctx.fillStyle = 'rgba(255,230,120,0.14)';
-      ctx.beginPath(); ctx.ellipse(this.aimX, this.aimY, r, r * 0.75, 0, 0, TAU); ctx.fill();
-      ctx.lineWidth = 4; ctx.strokeStyle = `rgba(255,230,120,${0.6 + 0.4 * Math.sin(t * 8)})`; ctx.stroke();
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(this.aimX - 16, this.aimY); ctx.lineTo(this.aimX + 16, this.aimY);
-      ctx.moveTo(this.aimX, this.aimY - 12); ctx.lineTo(this.aimX, this.aimY + 12);
-      ctx.stroke();
+    // price tags: always for empty spots and the armory, upgrades only when the King is near
+    for (const sp of this.spots) {
+      const cost = this.spotCost(sp);
+      if (cost === null) continue;
+      const near = !k.dead && dist2(k.x, k.y, sp.x, sp.y) < 170 * 170;
+      const show = sp.level === 0 || ARMORY[sp.kind] || near || sp.paid > 0;
+      if (!show) continue;
+      const by = sp.kind === 'tower' ? sp.y - (sp.level ? 128 : 44) : sp.kind === 'wall' ? sp.y - 62 : sp.y - 46;
+      drawCostBubble(ctx, sp.x, by, cost, sp.paid, this.coins >= cost - sp.paid);
     }
+
+    // King HP + respawn timer
+    if (!k.dead && k.hp < k.maxHp) this.bar(ctx, k.x, k.y - 74, 46, 7, k.hp / k.maxHp, '#7be36a');
+    if (k.dead) text(ctx, `King returns in ${Math.ceil(k.respawnT)}`, 360, this.townTop - 34, { size: 22, color: '#ffe9a8', lw: 5 });
+    // Keep HP
+    const kf = this.keepHp / this.keepMax;
+    this.bar(ctx, 360, this.townTop - 8, 200, 14, kf, kf > 0.5 ? '#7be36a' : kf > 0.25 ? '#ffc94a' : '#ff6a50');
+    text(ctx, `Keep ${Math.ceil(this.keepHp)}`, 360, this.townTop - 7, { size: 13, color: '#fff', lw: 3 });
 
     for (const tx of this.texts) {
       ctx.globalAlpha = clamp((tx.life / tx.max) * 1.5, 0, 1);
@@ -940,57 +883,55 @@ export class Battle {
     ctx.globalAlpha = 1;
     ctx.restore();
 
-    if (this.flash > 0) {
-      ctx.fillStyle = `rgba(220,245,255,${this.flash * 0.3})`;
-      ctx.fillRect(0, 0, W, H);
+    // joystick
+    if (this.joy) {
+      const j = this.joy;
+      ctx.globalAlpha = 0.35;
+      ctx.beginPath(); ctx.arc(j.ox, j.oy, 70, 0, TAU); ctx.fillStyle = '#1a100b'; ctx.fill();
+      ctx.lineWidth = 3; ctx.strokeStyle = '#fff3d6'; ctx.stroke();
+      ctx.globalAlpha = 0.8;
+      ctx.beginPath(); ctx.arc(j.x, j.y, 30, 0, TAU); ctx.fillStyle = '#fff3d6'; ctx.fill();
+      ctx.globalAlpha = 1;
     }
 
     // ---------------- UI
     this.drawHud(ctx);
-    this.drawPanel(ctx);
     this.drawWaveButton(ctx);
-    this.drawPopup(ctx);
     this.drawHints(ctx);
     this.drawBanner(ctx);
-    if (this.phase === 'boon' && this.boonChoices) this.drawBoons(ctx);
-    else if (this.paused && this.phase !== 'end') this.drawPause(ctx);
+    if (this.paused && this.phase !== 'end') this.drawPause(ctx);
     if (this.result && this.result.t > 0.8) this.drawResult(ctx);
   }
 
+  drawWallSpot(ctx, sp) {
+    drawBarricade(ctx, sp, this.time);
+    if (sp.hp < sp.maxHp) this.bar(ctx, sp.x, sp.y - 50, 60, 7, sp.hp / sp.maxHp, '#e8b04a');
+  }
+
+  bar(ctx, cx, cy, w, h, frac, color) {
+    ctx.fillStyle = 'rgba(20,10,5,0.85)';
+    ctx.fillRect(cx - w / 2 - 2, cy - h / 2 - 2, w + 4, h + 4);
+    ctx.fillStyle = color;
+    ctx.fillRect(cx - w / 2, cy - h / 2, w * clamp(frac, 0, 1), h);
+  }
+
   drawProjectile(ctx, p) {
-    if (p.kind === 'arrow' || p.kind === 'ebolt') {
-      const c = Math.cos(p.angle), s = Math.sin(p.angle);
-      const len = p.kind === 'ebolt' ? 14 : 18;
-      ctx.lineCap = 'round';
-      ctx.strokeStyle = p.kind === 'ebolt' ? '#2a1a10' : '#4a3220'; ctx.lineWidth = 3;
-      ctx.beginPath(); ctx.moveTo(p.x - c * len, p.y - s * len); ctx.lineTo(p.x, p.y); ctx.stroke();
-      ctx.strokeStyle = p.slow > 0 ? '#9fe0ff' : '#e8e8e8'; ctx.lineWidth = 3;
-      ctx.beginPath(); ctx.moveTo(p.x - c * 4, p.y - s * 4); ctx.lineTo(p.x + c * 2, p.y + s * 2); ctx.stroke();
-      if (p.kind === 'arrow') {
-        ctx.strokeStyle = '#d23b3b'; ctx.lineWidth = 3;
-        ctx.beginPath(); ctx.moveTo(p.x - c * 18, p.y - s * 18); ctx.lineTo(p.x - c * 13, p.y - s * 13); ctx.stroke();
-      }
-    } else if (p.kind === 'axe') {
-      ctx.save();
-      ctx.translate(p.x, p.y); ctx.rotate(p.spin);
-      ctx.strokeStyle = '#6b4529'; ctx.lineWidth = 4; ctx.lineCap = 'round';
-      ctx.beginPath(); ctx.moveTo(0, 10); ctx.lineTo(0, -10); ctx.stroke();
-      ctx.fillStyle = '#d4d8e0'; ctx.strokeStyle = '#2a1a12'; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(0, -10); ctx.quadraticCurveTo(12, -12, 10, 0); ctx.lineTo(0, -3); ctx.closePath(); ctx.fill(); ctx.stroke();
-      ctx.restore();
-    } else if (p.kind === 'fireball' || p.kind === 'arcane') {
-      const g = ctx.createRadialGradient(p.x, p.y, 1, p.x, p.y, 16);
-      if (p.kind === 'fireball') { g.addColorStop(0, '#fff6c0'); g.addColorStop(0.45, '#ff9a2e'); g.addColorStop(1, 'rgba(255,80,20,0)'); }
-      else { g.addColorStop(0, '#ffffff'); g.addColorStop(0.45, '#c86aff'); g.addColorStop(1, 'rgba(140,40,255,0)'); }
-      ctx.fillStyle = g;
-      ctx.beginPath(); ctx.arc(p.x, p.y, 16, 0, TAU); ctx.fill();
-    } else if (p.kind === 'ball') {
-      const lift = Math.sin(Math.PI * p.prog) * 50;
-      shadow(ctx, p.x, p.y + 10, 8, 4, 0.3);
-      ctx.fillStyle = '#26221f';
-      ctx.beginPath(); ctx.arc(p.x, p.y - lift, 8, 0, TAU); ctx.fill();
-      ctx.fillStyle = 'rgba(255,255,255,0.35)';
-      ctx.beginPath(); ctx.arc(p.x - 3, p.y - lift - 3, 2.5, 0, TAU); ctx.fill();
+    const c = Math.cos(p.angle), s = Math.sin(p.angle);
+    const len = p.kind === 'ebolt' ? 14 : 18;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = p.kind === 'ebolt' ? '#2a1a10' : '#4a3220'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(p.x - c * len, p.y - s * len); ctx.lineTo(p.x, p.y); ctx.stroke();
+    ctx.strokeStyle = p.royal ? '#ffd23f' : '#e8e8e8'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(p.x - c * 4, p.y - s * 4); ctx.lineTo(p.x + c * 2, p.y + s * 2); ctx.stroke();
+    if (p.kind === 'arrow') {
+      ctx.strokeStyle = p.royal ? '#2f5fb0' : '#d23b3b'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(p.x - c * 18, p.y - s * 18); ctx.lineTo(p.x - c * 13, p.y - s * 13); ctx.stroke();
+    } else if (p.hitKind === 'king') {
+      // warning marker where the bolt will land
+      ctx.globalAlpha = 0.6;
+      ctx.strokeStyle = '#ff5a3a'; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.ellipse(p.tx, p.ty + 18, 16, 7, 0, 0, TAU); ctx.stroke();
+      ctx.globalAlpha = 1;
     }
   }
 
@@ -1012,93 +953,26 @@ export class Battle {
     const foes = this.spawnQueue.length + this.enemies.length;
     const sub = this.phase === 'wave' ? `${foes} foes left`
       : this.endless ? `Best: wave ${save.data.endlessBest || 0}`
-      : this.phase === 'prep' ? `Stage ${this.stage.id}` : 'Breather';
+      : this.phase === 'prep' ? `Stage ${this.stage.id}` : 'Build time';
     text(ctx, sub, 30, cy + 15, { size: 16, align: 'left', color: '#d9c3a0', weight: 700 });
 
     roundRect(ctx, 240, cy - 30, 190, 60, 18);
     ctx.fillStyle = '#3a281d'; ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = '#120b07'; ctx.stroke();
-    coin(ctx, 272, cy, 16);
-    text(ctx, `${Math.floor(this.gold)}`, 298, cy + 1, { size: 30, align: 'left', color: '#ffd34d', lw: 5 });
+    drawCoinIcon(ctx, 272, cy, 16);
+    text(ctx, `${this.coins}`, 298, cy + 1, { size: 30, align: 'left', color: '#ffd34d', lw: 5 });
 
     const sb = { x: W - 168, y: cy - 30, w: 74, h: 60 };
     button(ctx, sb, `${this.speed}×`, { color: this.speed > 1 ? 'green' : 'wood', size: 28 });
     this.addHit(sb, () => { this.speed = this.speed === 1 ? 2 : 1; audio.play('click'); });
     const pb = { x: W - 84, y: cy - 30, w: 70, h: 60 };
     button(ctx, pb, 'II', { color: 'wood', size: 26 });
-    this.addHit(pb, () => { if (this.phase !== 'end') { this.paused = true; audio.play('click'); } });
-  }
-
-  drawPanel(ctx) {
-    const { W, H } = view;
-    const top = this.panelTop;
-    ctx.fillStyle = '#3a281d';
-    ctx.fillRect(0, top, W, H - top);
-    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
-    ctx.lineWidth = 2;
-    for (let y = top + 44; y < H; y += 44) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
-    ctx.fillStyle = '#1e140f';
-    ctx.fillRect(0, top, W, 5);
-
-    const bx = 24, by = top + 14, bw = W - 48, bh = 30;
-    const frac = this.wallHp / this.wallMax;
-    roundRect(ctx, bx, by, bw, bh, 15);
-    ctx.fillStyle = '#1a100b'; ctx.fill();
-    if (frac > 0) {
-      roundRect(ctx, bx + 3, by + 3, Math.max(24, (bw - 6) * frac), bh - 6, 12);
-      const g = ctx.createLinearGradient(0, by, 0, by + bh);
-      const [c1, c2] = frac > 0.5 ? ['#9be37a', '#3f9a36'] : frac > 0.25 ? ['#ffd866', '#d48a1e'] : ['#ff8a70', '#c8412e'];
-      g.addColorStop(0, c1); g.addColorStop(1, c2);
-      ctx.fillStyle = g; ctx.fill();
-    }
-    text(ctx, `Wall  ${Math.ceil(this.wallHp)} / ${this.wallMax}`, W / 2, by + bh / 2 + 1, { size: 18, lw: 4 });
-
-    const cw = 216, ch = 126, gap = (W - 3 * cw) / 4;
-    this.heroes.forEach((h, i) => {
-      const x = gap + i * (cw + gap), y = top + 56;
-      const sk = h.def.skill;
-      const ready = h.cd <= 0;
-      const aiming = this.aiming === i;
-      roundRect(ctx, x, y + 4, cw, ch, 18);
-      ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.fill();
-      roundRect(ctx, x, y, cw, ch, 18);
-      ctx.fillStyle = aiming ? '#4a3420' : '#24170f'; ctx.fill();
-      ctx.lineWidth = aiming ? 6 : 4;
-      ctx.strokeStyle = aiming ? '#ffe066' : ready ? h.def.color : '#4a3a2e';
-      ctx.stroke();
-
-      const px = x + 50, py = y + ch / 2;
-      if (ready) {
-        ctx.save();
-        ctx.globalAlpha = 0.55 + 0.45 * Math.sin(this.time * 5 + i);
-        ctx.beginPath(); ctx.arc(px, py, 44, 0, TAU); ctx.lineWidth = 5; ctx.strokeStyle = '#ffd34d'; ctx.stroke();
-        ctx.restore();
-      }
-      drawPortrait(ctx, h.def.id, px, py, 38);
-      ctx.beginPath(); ctx.arc(px, py, 38, 0, TAU); ctx.lineWidth = 3; ctx.strokeStyle = '#120b07'; ctx.stroke();
-      if (!ready) {
-        const total = sk.cd * this.mods.cd;
-        const k = clamp(h.cd / total, 0, 1);
-        ctx.fillStyle = 'rgba(10,6,4,0.65)';
-        ctx.beginPath(); ctx.moveTo(px, py); ctx.arc(px, py, 38, -Math.PI / 2, -Math.PI / 2 + TAU * k); ctx.closePath(); ctx.fill();
-        text(ctx, `${Math.ceil(h.cd)}`, px, py + 1, { size: 30, lw: 5 });
-      }
-      text(ctx, h.def.name, x + 96, y + 28, { size: 24, align: 'left', color: '#fff3d6', lw: 4 });
-      text(ctx, sk.name, x + 96, y + 56, { size: 15, align: 'left', color: '#d9c3a0', weight: 700 });
-      const pill = { x: x + 96, y: y + 76, w: 106, h: 34 };
-      roundRect(ctx, pill.x, pill.y, pill.w, pill.h, 12);
-      ctx.fillStyle = aiming ? '#ffe066' : ready ? '#e8a52a' : '#3a2c22';
-      ctx.fill();
-      text(ctx, aiming ? 'AIMING' : ready ? 'CAST' : 'charging', pill.x + pill.w / 2, pill.y + pill.h / 2 + 1, {
-        size: ready || aiming ? 18 : 14, color: ready || aiming ? '#2a1606' : '#8a7a6a', weight: 800,
-      });
-      this.addHit({ x, y, w: cw, h: ch }, () => this.tapHero(i));
-    });
+    this.addHit(pb, () => { if (this.phase !== 'end') { this.paused = true; this.joy = null; audio.play('click'); } });
   }
 
   drawWaveButton(ctx) {
     if (this.phase !== 'prep' && this.phase !== 'inter') return;
     const { W } = view;
-    const r = { x: W / 2 - 175, y: this.fieldTop + 20, w: 350, h: 84 };
+    const r = { x: W / 2 - 175, y: this.fieldTop + 16, w: 350, h: 80 };
     const pulse = 1 + 0.03 * Math.sin(this.time * 6);
     ctx.save();
     ctx.translate(W / 2, r.y + r.h / 2); ctx.scale(pulse, pulse); ctx.translate(-W / 2, -(r.y + r.h / 2));
@@ -1108,93 +982,27 @@ export class Battle {
       });
     } else {
       const s = Math.ceil(this.interT);
-      button(ctx, r, `Next Wave in ${s}`, { color: 'green', size: 30, sub: `Tap to call early: +${s * 2} gold` });
+      button(ctx, r, `Next Wave in ${s}`, { color: 'green', size: 30, sub: `Tap to call early: +${Math.ceil(this.interT / 2)} coins` });
     }
     ctx.restore();
     this.addHit(r, () => this.callWave());
   }
 
-  drawPopup(ctx) {
-    if (this.selected < 0 || this.phase === 'end' || this.phase === 'boon') return;
-    const { W } = view;
-    const p = this.pads[this.selected];
-    const tw = this.towerAt(this.selected);
-    const types = this.stage.towers;
-    const ow = 140, og = 12;
-    const w = tw ? 330 : types.length * ow + (types.length + 1) * og;
-    const h = 176;
-    const x = clamp(p.x - w / 2, 10, W - w - 10);
-    let y = p.y - (tw ? 130 : 60) - h;
-    if (y < this.fieldTop + 4) y = p.y + 44;
-    panel(ctx, x, y, w, h);
-    this.addHit({ x, y, w, h }, () => {});
-
-    if (!tw) {
-      text(ctx, 'Build a tower', x + w / 2, y + 26, { size: 20, color: '#fff3d6', lw: 4 });
-      types.forEach((type, k) => {
-        const def = TOWERS[type];
-        const cost = def.levels[0].cost;
-        const ok = this.gold >= cost;
-        const b = { x: x + og + k * (ow + og), y: y + 46, w: ow, h: 116 };
-        roundRect(ctx, b.x, b.y, b.w, b.h, 14);
-        ctx.fillStyle = ok ? '#5a3f2c' : '#2f221a'; ctx.fill();
-        ctx.lineWidth = 3; ctx.strokeStyle = ok ? '#e8a52a' : '#4a3a2e'; ctx.stroke();
-        ctx.save();
-        ctx.globalAlpha = ok ? 1 : 0.5;
-        ctx.translate(b.x + b.w / 2, b.y + 80);
-        ctx.scale(0.55, 0.55);
-        drawTower(ctx, { type, level: 1, x: 0, y: 0, anim: 0, angle: -Math.PI / 2 }, this.time);
-        ctx.restore();
-        text(ctx, def.short, b.x + b.w / 2, b.y + 14, { size: 16, color: '#fff3d6', weight: 800 });
-        coin(ctx, b.x + b.w / 2 - 26, b.y + 102, 9);
-        text(ctx, `${cost}`, b.x + b.w / 2 - 12, b.y + 103, { size: 20, align: 'left', color: ok ? '#ffd34d' : '#e06050', lw: 4 });
-        if (this.stage.newTower === type) {
-          roundRect(ctx, b.x + b.w - 46, b.y - 10, 52, 24, 10);
-          ctx.fillStyle = '#d23b3b'; ctx.fill();
-          text(ctx, 'NEW', b.x + b.w - 20, b.y + 2, { size: 14, color: '#fff' });
-        }
-        this.addHit(b, () => this.build(this.selected, type));
-      });
-    } else {
-      const def = TOWERS[tw.type];
-      const L = def.levels[tw.level - 1];
-      const next = def.levels[tw.level];
-      text(ctx, `${def.name}  Lv ${tw.level}`, x + w / 2, y + 28, { size: 22, color: '#fff3d6', lw: 4 });
-      const arrow = (a, b) => (b !== undefined && b !== a ? `${a} → ${b}` : `${a}`);
-      text(ctx, `Damage ${arrow(L.dmg, next?.dmg)}   Range ${arrow(L.range, next?.range)}`, x + w / 2, y + 60, { size: 15, color: '#d9c3a0', weight: 700 });
-      let third = `Speed ${arrow(L.rate, next?.rate)}/s`;
-      if (L.splash) third += `   Blast ${arrow(L.splash, next?.splash)}`;
-      if (L.slow) third += `   Slow ${arrow(Math.round(L.slow * 100), next && Math.round(next.slow * 100))}%`;
-      if (!def.air) third += '   Ground only';
-      text(ctx, third, x + w / 2, y + 84, { size: 15, color: '#d9c3a0', weight: 700 });
-      const ub = { x: x + 14, y: y + 104, w: 186, h: 58 };
-      if (next) {
-        button(ctx, ub, 'Upgrade', { color: 'gold', size: 22, sub: `${next.cost} gold`, disabled: this.gold < next.cost });
-        this.addHit(ub, () => this.upgrade(tw));
-      } else {
-        button(ctx, ub, 'MAX LEVEL', { color: 'gold', size: 22, disabled: true });
-      }
-      const sb = { x: x + 212, y: y + 104, w: 104, h: 58 };
-      button(ctx, sb, 'Sell', { color: 'red', size: 22, sub: `+${Math.floor(tw.spent * 0.6)}` });
-      this.addHit(sb, () => this.sell(tw));
-    }
-  }
-
   drawHints(ctx) {
+    if (this.phase !== 'prep') return;
     const { W } = view;
-    let msg = null;
-    if (this.aiming >= 0) msg = `Tap the field to cast ${this.heroes[this.aiming].def.skill.name}`;
-    else if (this.phase === 'prep' && this.selected < 0) {
-      if (this.stage.newTower) msg = `New tower unlocked: ${TOWERS[this.stage.newTower].name}!`;
-      else if (this.towers.length === 0) msg = 'Tap a stone pad to build a tower';
-    }
-    if (!msg) return;
-    const y = this.phase === 'prep' || this.phase === 'inter' ? this.fieldTop + 140 : this.fieldTop + 30;
-    ctx.font = '700 20px system-ui';
-    const w = Math.min(W - 40, ctx.measureText(msg).width + 50);
-    roundRect(ctx, W / 2 - w / 2, y - 22, w, 44, 22);
-    ctx.fillStyle = 'rgba(20,12,8,0.8)'; ctx.fill();
-    text(ctx, msg, W / 2, y + 1, { size: 20, color: '#ffe9a8', weight: 700 });
+    const built = this.spots.some((s) => s.level > 0);
+    const msgs = built
+      ? ['Coins drop where foes fall. Walk over them!', 'Tap Start when you’re ready']
+      : ['Drag anywhere to move the King', 'Stand on a spot to build it with coins'];
+    msgs.forEach((msg, i) => {
+      const y = this.fieldTop + 128 + i * 50;
+      ctx.font = '700 20px system-ui';
+      const w = Math.min(W - 40, ctx.measureText(msg).width + 50);
+      roundRect(ctx, W / 2 - w / 2, y - 21, w, 42, 21);
+      ctx.fillStyle = 'rgba(20,12,8,0.8)'; ctx.fill();
+      text(ctx, msg, W / 2, y + 1, { size: 20, color: '#ffe9a8', weight: 700 });
+    });
   }
 
   drawBanner(ctx) {
@@ -1204,7 +1012,7 @@ export class Battle {
     const end = b.long ? 3.1 : 1.9;
     const a = b.t < 0.25 ? b.t / 0.25 : b.t > end ? Math.max(0, 1 - (b.t - end) / 0.5) : 1;
     const s = b.t < 0.25 ? 0.7 + 0.3 * (b.t / 0.25) : 1;
-    const y = this.fieldTop + (this.wallY - this.fieldTop) * 0.4;
+    const y = this.fieldTop + (this.townTop - this.fieldTop) * 0.38;
     ctx.save();
     ctx.globalAlpha = a;
     ctx.translate(W / 2, y); ctx.scale(s, s);
@@ -1224,32 +1032,6 @@ export class Battle {
     ctx.fillStyle = `rgba(10,6,4,${a})`;
     ctx.fillRect(0, 0, W, H);
     this.addHit({ x: 0, y: 0, w: W, h: H }, () => {});
-  }
-
-  drawBoons(ctx) {
-    const { W, H } = view;
-    this.dim(ctx, 0.65);
-    const k = clamp(this.boonT / 0.3, 0, 1);
-    const cardH = 150, gap = 22;
-    const total = 3 * cardH + 2 * gap;
-    const y0 = H / 2 - total / 2 + 30;
-    text(ctx, 'Choose a Boon', W / 2, y0 - 70, { size: 46, color: '#ffd34d', lw: 7 });
-    text(ctx, 'It lasts for the rest of this battle', W / 2, y0 - 28, { size: 20, color: '#fff3d6', weight: 700 });
-    this.boonChoices.forEach((b, i) => {
-      const off = (1 - k) * 60 * (i + 1);
-      const r = { x: 40, y: y0 + i * (cardH + gap) + off, w: W - 80, h: cardH };
-      ctx.globalAlpha = k;
-      panel(ctx, r.x, r.y, r.w, r.h, { fill: '#4a3424', inner: '#e8a52a' });
-      roundRect(ctx, r.x + 20, r.y + 25, 100, 100, 20);
-      ctx.fillStyle = '#2a1c13'; ctx.fill();
-      ctx.font = '56px system-ui, "Apple Color Emoji", sans-serif';
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(b.icon, r.x + 70, r.y + 78);
-      text(ctx, b.name, r.x + 146, r.y + 54, { size: 30, align: 'left', color: '#ffd34d', lw: 5 });
-      text(ctx, b.desc, r.x + 146, r.y + 98, { size: b.desc.length > 32 ? 18 : 20, align: 'left', color: '#fff3d6', weight: 700 });
-      ctx.globalAlpha = 1;
-      this.addHit(r, () => { if (this.boonT > 0.35) this.chooseBoon(b); });
-    });
   }
 
   drawPause(ctx) {
@@ -1275,7 +1057,7 @@ export class Battle {
     const k = clamp((r.t - 0.8) / 0.35, 0, 1);
     this.dim(ctx, 0.6 * k);
     const extra = r.unlocks.length ? 50 + r.unlocks.length * 32 : 0;
-    const w = 580, h = 560 + extra, x = W / 2 - w / 2, y = H / 2 - h / 2 + (1 - k) * 80;
+    const w = 580, h = 520 + extra, x = W / 2 - w / 2, y = H / 2 - h / 2 + (1 - k) * 80;
     ctx.globalAlpha = k;
     panel(ctx, x, y, w, h);
     let lines;
@@ -1283,13 +1065,9 @@ export class Battle {
       text(ctx, 'Siege Broken', W / 2, y + 70, { size: 56, color: '#ff9a5a', lw: 8 });
       text(ctx, `${r.reached}`, W / 2, y + 160, { size: 84, color: '#ffd34d', lw: 9 });
       text(ctx, r.reached === 1 ? 'wave survived' : 'waves survived', W / 2, y + 214, { size: 22, color: '#fff3d6', weight: 700 });
-      lines = [
-        r.newBest ? 'New personal best!' : `Best: ${save.data.endlessBest} waves`,
-        `Foes defeated: ${this.kills}`,
-        `Boons: ${this.boonsTaken.map((b) => b.icon).join(' ') || '—'}`,
-      ];
+      lines = [r.newBest ? 'New personal best!' : `Best: ${save.data.endlessBest} waves`, `Foes defeated: ${this.kills}`];
     } else {
-      text(ctx, r.win ? 'Victory!' : 'The Wall Fell', W / 2, y + 70, { size: 58, color: r.win ? '#ffd34d' : '#ff7a5a', lw: 8 });
+      text(ctx, r.win ? 'Victory!' : 'The Keep Fell', W / 2, y + 70, { size: 58, color: r.win ? '#ffd34d' : '#ff7a5a', lw: 8 });
       for (let i = 0; i < 3; i++) {
         const appear = clamp((r.t - 1.2 - i * 0.25) / 0.2, 0, 1);
         const filled = r.win && i < r.stars && appear > 0;
@@ -1297,10 +1075,9 @@ export class Battle {
         star(ctx, W / 2 + (i - 1) * 110, y + 170 - (i === 1 ? 14 : 0), sz, filled);
       }
       lines = [
-        `Wall held: ${Math.round(r.frac * 100)}%`,
+        `Keep held: ${Math.round(r.frac * 100)}%`,
         `Waves survived: ${r.win ? this.totalWaves : Math.max(0, this.wave - 1)} / ${this.totalWaves}`,
         `Foes defeated: ${this.kills}`,
-        `Boons: ${this.boonsTaken.map((b) => b.icon).join(' ') || '—'}`,
       ];
     }
     lines.forEach((l, i) => text(ctx, l, W / 2, y + 262 + i * 36, { size: 22, color: '#fff3d6', weight: 700 }));
@@ -1309,7 +1086,6 @@ export class Battle {
       text(ctx, 'Unlocked', W / 2, uy, { size: 20, color: '#8fe07a', lw: 4 });
       r.unlocks.forEach((u, i) => text(ctx, u, W / 2, uy + 32 + i * 32, { size: 20, color: '#ffe9a8', weight: 700 }));
     }
-
     const next = !this.endless && r.win && STAGES[this.stageIdx + 1];
     const bw = next ? 160 : 220;
     const btns = [
